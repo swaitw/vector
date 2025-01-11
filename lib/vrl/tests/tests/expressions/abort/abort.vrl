@@ -1,5 +1,0 @@
-# result: { "foo": true }
-
-.foo = true
-abort
-.bar = false

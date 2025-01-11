@@ -1,8 +1,6 @@
-use super::{LogEvent, Value};
-use std::{
-    collections::BTreeMap,
-    hash::{Hash, Hasher},
-};
+use std::hash::{Hash, Hasher};
+
+use super::{LogEvent, ObjectMap, Value};
 
 // TODO: if we had `Value` implement `Eq` and `Hash`, the implementation here
 // would be much easier. The issue is with `f64` type. We should consider using
@@ -26,7 +24,13 @@ impl Discriminant {
     pub fn from_log_event(event: &LogEvent, discriminant_fields: &[impl AsRef<str>]) -> Self {
         let values: Vec<Option<Value>> = discriminant_fields
             .iter()
-            .map(|discriminant_field| event.get(discriminant_field).cloned())
+            .map(|discriminant_field| {
+                event
+                    .parse_path_and_get_value(discriminant_field.as_ref())
+                    .ok()
+                    .flatten()
+                    .cloned()
+            })
             .collect();
         Self { values }
     }
@@ -47,7 +51,7 @@ impl PartialEq for Discriminant {
 
 impl Eq for Discriminant {}
 
-// Equality check for for discriminant purposes.
+// Equality check for discriminant purposes.
 fn value_eq(this: &Value, other: &Value) -> bool {
     match (this, other) {
         // Trivial.
@@ -57,9 +61,9 @@ fn value_eq(this: &Value, other: &Value) -> bool {
         (Value::Timestamp(this), Value::Timestamp(other)) => this.eq(other),
         (Value::Null, Value::Null) => true,
         // Non-trivial.
-        (Value::Float(this), Value::Float(other)) => f64_eq(*this, *other),
+        (Value::Float(this), Value::Float(other)) => f64_eq(this.into_inner(), other.into_inner()),
         (Value::Array(this), Value::Array(other)) => array_eq(this, other),
-        (Value::Map(this), Value::Map(other)) => map_eq(this, other),
+        (Value::Object(this), Value::Object(other)) => map_eq(this, other),
         // Type mismatch.
         _ => false,
     }
@@ -91,7 +95,7 @@ fn array_eq(this: &[Value], other: &[Value]) -> bool {
         .all(|(first, second)| value_eq(first, second))
 }
 
-fn map_eq(this: &BTreeMap<String, Value>, other: &BTreeMap<String, Value>) -> bool {
+fn map_eq(this: &ObjectMap, other: &ObjectMap) -> bool {
     if this.len() != other.len() {
         return false;
     }
@@ -120,13 +124,14 @@ fn hash_value<H: Hasher>(hasher: &mut H, value: &Value) {
     match value {
         // Trivial.
         Value::Bytes(val) => val.hash(hasher),
+        Value::Regex(val) => val.as_bytes_slice().hash(hasher),
         Value::Boolean(val) => val.hash(hasher),
         Value::Integer(val) => val.hash(hasher),
         Value::Timestamp(val) => val.hash(hasher),
         // Non-trivial.
-        Value::Float(val) => hash_f64(hasher, *val),
+        Value::Float(val) => hash_f64(hasher, val.into_inner()),
         Value::Array(val) => hash_array(hasher, val),
-        Value::Map(val) => hash_map(hasher, val),
+        Value::Object(val) => hash_map(hasher, val),
         Value::Null => hash_null(hasher),
     }
 }
@@ -137,13 +142,13 @@ fn hash_f64<H: Hasher>(hasher: &mut H, value: f64) {
 }
 
 fn hash_array<H: Hasher>(hasher: &mut H, array: &[Value]) {
-    for val in array.iter() {
+    for val in array {
         hash_value(hasher, val);
     }
 }
 
-fn hash_map<H: Hasher>(hasher: &mut H, map: &BTreeMap<String, Value>) {
-    for (key, val) in map.iter() {
+fn hash_map<H: Hasher>(hasher: &mut H, map: &ObjectMap) {
+    for (key, val) in map {
         hasher.write(key.as_bytes());
         hash_value(hasher, val);
     }
@@ -155,9 +160,10 @@ fn hash_null<H: Hasher>(hasher: &mut H) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{hash_map::DefaultHasher, HashMap};
+
     use super::*;
     use crate::event::LogEvent;
-    use std::collections::{hash_map::DefaultHasher, HashMap};
 
     fn hash<H: Hash>(hash: H) -> u64 {
         let mut hasher = DefaultHasher::new();
@@ -286,6 +292,7 @@ mod tests {
 
     #[test]
     fn with_hash_map() {
+        #[allow(clippy::mutable_key_type)]
         let mut map: HashMap<Discriminant, usize> = HashMap::new();
 
         let event_stream_1 = {

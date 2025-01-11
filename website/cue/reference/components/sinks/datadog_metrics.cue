@@ -3,17 +3,20 @@ package metadata
 components: sinks: datadog_metrics: {
 	title: "Datadog Metrics"
 
-	classes: sinks._datadog.classes
+	classes: sinks._datadog.classes & {
+		stateful: true
+	}
 
 	features: {
-		buffer: enabled:      false
+		acknowledgements: true
+		auto_generated:   true
 		healthcheck: enabled: true
 		send: {
 			batch: {
 				enabled:      true
 				common:       false
-				max_events:   20
-				timeout_secs: 1
+				max_events:   100_000
+				timeout_secs: 2.0
 			}
 			compression: enabled: false
 			encoding: enabled:    false
@@ -27,7 +30,13 @@ components: sinks: datadog_metrics: {
 				timeout_secs:               60
 				headers:                    false
 			}
-			tls: enabled: false
+			tls: {
+				enabled:                true
+				can_verify_certificate: true
+				can_verify_hostname:    true
+				enabled_default:        true
+				enabled_by_scheme:      true
+			}
 			to: {
 				service: services.datadog_metrics
 
@@ -48,25 +57,7 @@ components: sinks: datadog_metrics: {
 
 	support: sinks._datadog.support
 
-	configuration: {
-		api_key:  sinks._datadog.configuration.api_key
-		endpoint: sinks._datadog.configuration.endpoint
-		region:   sinks._datadog.configuration.region
-		default_namespace: {
-			common: true
-			description: """
-				Used as a namespace for metrics that don't have it.
-				A namespace will be prefixed to a metric's name.
-				"""
-			required: false
-			warnings: []
-			type: string: {
-				default: null
-				examples: ["service"]
-				syntax: "literal"
-			}
-		}
-	}
+	configuration: base.components.sinks.datadog_metrics.configuration
 
 	input: {
 		logs: false
@@ -78,10 +69,6 @@ components: sinks: datadog_metrics: {
 			set:          false
 			summary:      false
 		}
-	}
-
-	telemetry: metrics: {
-		component_sent_events_total:      components.sources.internal_metrics.output.metrics.component_sent_events_total
-		component_sent_event_bytes_total: components.sources.internal_metrics.output.metrics.component_sent_event_bytes_total
+		traces: false
 	}
 }

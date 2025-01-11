@@ -1,4 +1,4 @@
-//! FIXME: A workaround to fix <https://github.com/timberio/vector/issues/1480> resulting from <https://github.com/rust-lang/rust/issues/63010>
+//! FIXME: A workaround to fix <https://github.com/vectordotdev/vector/issues/1480> resulting from <https://github.com/rust-lang/rust/issues/63010>
 //! Most of code is cribbed directly from the Rust stdlib and ported to work with winapi.
 //!
 //! In stdlib imported code, warnings are allowed.
@@ -8,6 +8,7 @@ use std::fs::File;
 use std::os::unix::fs::MetadataExt;
 #[cfg(windows)]
 use std::{mem::zeroed, ptr};
+
 #[cfg(windows)]
 use winapi::shared::minwindef::DWORD;
 #[cfg(windows)]
@@ -94,7 +95,7 @@ impl PortableFileExt for File {
 
 // This code is from the Rust stdlib https://github.com/rust-lang/rust/blob/a916ac22b9f7f1f0f7aba0a41a789b3ecd765018/src/libstd/sys/windows/c.rs#L380-L386
 #[cfg(windows)]
-#[allow(non_snake_case, non_camel_case_types)]
+#[allow(dead_code, non_snake_case, non_camel_case_types)]
 pub struct REPARSE_DATA_BUFFER {
     pub ReparseTag: libc::c_uint,
     pub ReparseDataLength: libc::c_ushort,

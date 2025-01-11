@@ -8,19 +8,20 @@ components: sinks: prometheus_remote_write: {
 		delivery:      "at_least_once"
 		development:   "beta"
 		egress_method: "batch"
-		service_providers: []
-		stateful: false
+		service_providers: ["AWS"]
+		stateful: true
 	}
 
 	features: {
-		buffer: enabled:      false
+		auto_generated:   true
+		acknowledgements: true
 		healthcheck: enabled: true
 		send: {
 			batch: {
 				enabled:      true
 				common:       false
 				max_events:   1000
-				timeout_secs: 1
+				timeout_secs: 1.0
 			}
 			// TODO Snappy is always enabled
 			compression: enabled: false
@@ -37,10 +38,10 @@ components: sinks: prometheus_remote_write: {
 			}
 			tls: {
 				enabled:                true
-				can_enable:             false
 				can_verify_certificate: true
 				can_verify_hostname:    true
 				enabled_default:        false
+				enabled_by_scheme:      true
 			}
 			to: {
 				service: services.prometheus_remote_write
@@ -61,16 +62,6 @@ components: sinks: prometheus_remote_write: {
 	}
 
 	support: {
-		targets: {
-			"aarch64-unknown-linux-gnu":      true
-			"aarch64-unknown-linux-musl":     true
-			"armv7-unknown-linux-gnueabihf":  true
-			"armv7-unknown-linux-musleabihf": true
-			"x86_64-apple-darwin":            true
-			"x86_64-pc-windows-msv":          true
-			"x86_64-unknown-linux-gnu":       true
-			"x86_64-unknown-linux-musl":      true
-		}
 		requirements: []
 		warnings: [
 			"""
@@ -85,67 +76,7 @@ components: sinks: prometheus_remote_write: {
 		notices: []
 	}
 
-	configuration: {
-		endpoint: {
-			description: "The endpoint URL to send data to."
-			required:    true
-			warnings: []
-			type: string: {
-				examples: ["https://localhost:8087/"]
-				syntax: "literal"
-			}
-		}
-		auth: configuration._http_auth & {_args: {
-			password_example: "${HTTP_PASSWORD}"
-			username_example: "${HTTP_USERNAME}"
-		}}
-		default_namespace: {
-			common:      true
-			description: """
-				Used as a namespace for metrics that don't have it.
-				A namespace will be prefixed to a metric's name.
-				It should follow Prometheus [naming conventions](\(urls.prometheus_metric_naming)).
-				"""
-			required:    false
-			warnings: []
-			type: string: {
-				default: null
-				examples: ["service"]
-				syntax: "literal"
-			}
-		}
-		buckets: {
-			common:      false
-			description: "Default buckets to use for aggregating [distribution](\(urls.vector_metric)/#distribution) metrics into histograms."
-			required:    false
-			warnings: []
-			type: array: {
-				default: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]
-				items: type: float: examples: [0.005, 0.01]
-			}
-		}
-		quantiles: {
-			common:      false
-			description: "Quantiles to use for aggregating [distribution](\(urls.vector_metric)/#distribution) metrics into a summary."
-			required:    false
-			warnings: []
-			type: array: {
-				default: [0.5, 0.75, 0.9, 0.95, 0.99]
-				items: type: float: examples: [0.5, 0.75, 0.9, 0.95, 0.99]
-			}
-		}
-		tenant_id: {
-			common:      false
-			description: "If set, a header named `X-Scope-OrgID` will be added to outgoing requests with the text of this setting. This may be used by Cortex or other remote services to identify the tenant making the request."
-			required:    false
-			warnings: []
-			type: string: {
-				default: null
-				examples: ["my-domain"]
-				syntax: "template"
-			}
-		}
-	}
+	configuration: base.components.sinks.prometheus_remote_write.configuration
 
 	input: {
 		logs: false
@@ -157,11 +88,26 @@ components: sinks: prometheus_remote_write: {
 			set:          false
 			summary:      true
 		}
+		traces: false
 	}
 
-	telemetry: metrics: {
-		component_sent_events_total:      components.sources.internal_metrics.output.metrics.component_sent_events_total
-		component_sent_event_bytes_total: components.sources.internal_metrics.output.metrics.component_sent_event_bytes_total
-		processing_errors_total:          components.sources.internal_metrics.output.metrics.processing_errors_total
+	how_it_works: {
+		duplicate_tag_names: {
+			title: "Duplicate tag names"
+			body: """
+				Multiple tags with the same name are invalid within Prometheus and Prometheus
+				will reject a metric with duplicate tag names. When sending a tag with multiple
+				values for each name, Vector will only send the last value specified.
+				"""
+		}
+		compression_schemes: {
+			title: "Compression schemes"
+			body:  """
+				Officially according to the [Prometheus Remote-Write specification](\(urls.prometheus_remote_write_spec)),
+				the only supported compression scheme is [Snappy](\(urls.snappy)). However,
+				there are a number of other implementations that do support other schemes. Thus
+				Vector also supports using Gzip and Zstd.
+				"""
+		}
 	}
 }

@@ -1,3 +1,7 @@
+use std::cmp;
+
+use async_graphql::{Enum, InputObject, Object};
+
 use super::{source, state, transform, Component};
 use crate::{
     api::schema::{
@@ -5,17 +9,15 @@ use crate::{
         metrics::{self, IntoSinkMetrics},
         sort,
     },
-    config::{ComponentKey, OutputId},
+    config::{ComponentKey, Inputs, OutputId},
     filter_check,
 };
-use async_graphql::{Enum, InputObject, Object};
-use std::cmp;
 
 #[derive(Debug, Clone)]
 pub struct Data {
     pub component_key: ComponentKey,
     pub component_type: String,
-    pub inputs: Vec<OutputId>,
+    pub inputs: Inputs<OutputId>,
 }
 
 #[derive(Debug, Clone)]
@@ -84,7 +86,7 @@ impl Sink {
 
     /// Sink type
     pub async fn component_type(&self) -> &str {
-        &*self.get_component_type()
+        self.get_component_type()
     }
 
     /// Source inputs
@@ -127,17 +129,17 @@ mod tests {
             Sink(Data {
                 component_key: ComponentKey::from("webserver"),
                 component_type: "http".to_string(),
-                inputs: vec![],
+                inputs: Inputs::default(),
             }),
             Sink(Data {
                 component_key: ComponentKey::from("db"),
                 component_type: "clickhouse".to_string(),
-                inputs: vec![],
+                inputs: Inputs::default(),
             }),
             Sink(Data {
                 component_key: ComponentKey::from("zip_drive"),
                 component_type: "file".to_string(),
-                inputs: vec![],
+                inputs: Inputs::default(),
             }),
         ]
     }

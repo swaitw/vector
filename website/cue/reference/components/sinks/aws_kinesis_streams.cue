@@ -13,7 +13,8 @@ components: sinks: aws_kinesis_streams: components._aws & {
 	}
 
 	features: {
-		buffer: enabled:      true
+		acknowledgements: true
+		auto_generated:   true
 		healthcheck: enabled: true
 		send: {
 			batch: {
@@ -21,7 +22,7 @@ components: sinks: aws_kinesis_streams: components._aws & {
 				common:       false
 				max_bytes:    5000000
 				max_events:   500
-				timeout_secs: 1
+				timeout_secs: 1.0
 			}
 			compression: {
 				enabled: true
@@ -41,7 +42,13 @@ components: sinks: aws_kinesis_streams: components._aws & {
 				enabled: true
 				headers: false
 			}
-			tls: enabled: false
+			tls: {
+				enabled:                true
+				can_verify_certificate: true
+				can_verify_hostname:    true
+				enabled_default:        true
+				enabled_by_scheme:      true
+			}
 			to: {
 				service: services.aws_kinesis_data_streams
 
@@ -61,47 +68,19 @@ components: sinks: aws_kinesis_streams: components._aws & {
 	}
 
 	support: {
-		targets: {
-			"aarch64-unknown-linux-gnu":      true
-			"aarch64-unknown-linux-musl":     true
-			"armv7-unknown-linux-gnueabihf":  true
-			"armv7-unknown-linux-musleabihf": true
-			"x86_64-apple-darwin":            true
-			"x86_64-pc-windows-msv":          true
-			"x86_64-unknown-linux-gnu":       true
-			"x86_64-unknown-linux-musl":      true
-		}
 		requirements: []
-		warnings: []
 		notices: []
+		warnings: []
 	}
 
-	configuration: {
-		partition_key_field: {
-			common:      true
-			description: "The log field used as the Kinesis record's partition key value."
-			required:    false
-			warnings: []
-			type: string: {
-				default: null
-				examples: ["user_id"]
-				syntax: "literal"
-			}
-		}
-		stream_name: {
-			description: "The [stream name](\(urls.aws_cloudwatch_logs_stream_name)) of the target Kinesis Logs stream."
-			required:    true
-			warnings: []
-			type: string: {
-				examples: ["my-stream"]
-				syntax: "literal"
-			}
-		}
+	configuration: base.components.sinks.aws_kinesis_streams.configuration & {
+		_aws_include: false
 	}
 
 	input: {
 		logs:    true
 		metrics: null
+		traces:  false
 	}
 
 	how_it_works: {
@@ -162,11 +141,4 @@ components: sinks: aws_kinesis_streams: components._aws & {
 			]
 		},
 	]
-
-	telemetry: metrics: {
-		component_sent_events_total:      components.sources.internal_metrics.output.metrics.component_sent_events_total
-		component_sent_event_bytes_total: components.sources.internal_metrics.output.metrics.component_sent_event_bytes_total
-		processed_bytes_total:            components.sources.internal_metrics.output.metrics.processed_bytes_total
-		processed_events_total:           components.sources.internal_metrics.output.metrics.processed_events_total
-	}
 }

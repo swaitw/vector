@@ -13,14 +13,15 @@ components: sinks: elasticsearch: {
 	}
 
 	features: {
-		buffer: enabled:      true
+		acknowledgements: true
+		auto_generated:   true
 		healthcheck: enabled: true
 		send: {
 			batch: {
 				enabled:      true
 				common:       false
-				max_bytes:    10490000
-				timeout_secs: 1
+				max_bytes:    10_000_000
+				timeout_secs: 1.0
 			}
 			compression: {
 				enabled: true
@@ -39,10 +40,10 @@ components: sinks: elasticsearch: {
 			}
 			tls: {
 				enabled:                true
-				can_enable:             false
 				can_verify_certificate: true
 				can_verify_hostname:    true
 				enabled_default:        false
+				enabled_by_scheme:      true
 			}
 			to: {
 				service: services.elasticsearch
@@ -63,19 +64,9 @@ components: sinks: elasticsearch: {
 	}
 
 	support: {
-		targets: {
-			"aarch64-unknown-linux-gnu":      true
-			"aarch64-unknown-linux-musl":     true
-			"armv7-unknown-linux-gnueabihf":  true
-			"armv7-unknown-linux-musleabihf": true
-			"x86_64-apple-darwin":            true
-			"x86_64-pc-windows-msv":          true
-			"x86_64-unknown-linux-gnu":       true
-			"x86_64-unknown-linux-musl":      true
-		}
 		requirements: [
 			#"""
-				Elasticsearch's Data streams feature requires Vector to be configured with the `create` `bulk_action`.
+				Elasticsearch's Data streams feature requires Vector to be configured with the `create` `bulk.action`.
 				This is *not* enabled by default.
 				"""#,
 		]
@@ -83,283 +74,12 @@ components: sinks: elasticsearch: {
 		notices: []
 	}
 
-	configuration: {
-		auth: {
-			common:      false
-			description: "Options for the authentication strategy."
-			required:    false
-			warnings: []
-			type: object: {
-				examples: []
-				options: components._aws.configuration.auth.type.object.options & {
-					password: {
-						description: "The basic authentication password."
-						required:    true
-						warnings: []
-						type: string: {
-							examples: ["${ELASTICSEARCH_PASSWORD}", "password"]
-							syntax: "literal"
-						}
-					}
-					strategy: {
-						description: "The authentication strategy to use."
-						required:    true
-						warnings: []
-						type: string: {
-							enum: {
-								aws:   "Authentication strategy used for [AWS' hosted Elasticsearch service](\(urls.aws_elasticsearch))."
-								basic: "The [basic authentication strategy](\(urls.basic_auth))."
-							}
-							syntax: "literal"
-						}
-					}
-					user: {
-						description: "The basic authentication user name."
-						required:    true
-						warnings: []
-						type: string: {
-							examples: ["${ELASTICSEARCH_USERNAME}", "username"]
-							syntax: "literal"
-						}
-					}
-				}
-			}
-		}
-		aws: {
-			common:      false
-			description: "Options for the AWS connections."
-			required:    false
-			warnings: []
-			type: object: {
-				examples: []
-				options: {
-					region: {
-						common:      true
-						description: "The [AWS region](\(urls.aws_regions)) of the target service. This defaults to the region named in the endpoint parameter, or the value of the `$AWS_REGION` or `$AWS_DEFAULT_REGION` environment variables if that cannot be determined, or \"us-east-1\"."
-						required:    false
-						warnings: []
-						type: string: {
-							default: null
-							examples: ["us-east-1"]
-							syntax: "literal"
-						}
-					}
-				}
-			}
-		}
-		bulk_action: {
-			common:      false
-			description: """
-				Action to use when making requests to the [Elasticsearch Bulk API](\(urls.elasticsearch_bulk)).
-				Currently, Vector only supports `index` and `create`. `update` and `delete` actions are not supported.
-				"""
-			required:    false
-			warnings: ["This option has been deprecated, the `normal.bulk_action` option should be used."]
-			type: string: {
-				default: "index"
-				examples: ["index", "create", "{{ action }}"]
-				syntax: "template"
-			}
-		}
-		bulk: {
-			common:      true
-			description: "Options for the bulk mode."
-			required:    false
-			warnings: []
-			type: object: {
-				examples: []
-				options: {
-					action: {
-						common:      false
-						description: """
-							Action to use when making requests to the [Elasticsearch Bulk API](\(urls.elasticsearch_bulk)).
-							Currently, Vector only supports `index` and `create`. `update` and `delete` actions are not supported.
-							"""
-						required:    false
-						warnings: []
-						type: string: {
-							default: "index"
-							examples: ["index", "create", "{{ action }}"]
-							syntax: "template"
-						}
-					}
-					index: {
-						common:      true
-						description: "Index name to write events to."
-						required:    false
-						warnings: []
-						type: string: {
-							default: "vector-%F"
-							examples: ["application-{{ application_id }}-%Y-%m-%d", "vector-%Y-%m-%d"]
-							syntax: "template"
-						}
-					}
-				}
-			}
-		}
-		data_stream: {
-			common:      false
-			description: "Options for the data stream mode."
-			required:    false
-			warnings: []
-			type: object: {
-				examples: []
-				options: {
-					auto_routing: {
-						common: false
-						description: """
-							Automatically routes events by deriving the data stream name using specific event fields with the `data_stream.type-data_stream.dataset-data_stream.namespace` format.
-
-							If enabled, the data_stream.* event fields will take precedence over the data_stream.type, data_stream.dataset, and data_stream.namespace settings, but will fall back to them if any of the fields are missing from the event.
-							"""
-						required: false
-						warnings: []
-						type: bool: default: true
-					}
-					dataset: {
-						common:      false
-						description: "The data stream dataset used to construct the data stream at index time."
-						required:    false
-						warnings: []
-						type: string: {
-							default: "generic"
-							examples: ["generic", "nginx", "{{ service }}"]
-							syntax: "template"
-						}
-					}
-					namespace: {
-						common:      false
-						description: "The data stream namespace used to construct the data stream at index time."
-						required:    false
-						warnings: []
-						type: string: {
-							default: "default"
-							examples: ["default", "{{ environment }}"]
-							syntax: "template"
-						}
-					}
-					sync_fields: {
-						common:      false
-						description: "Automatically adds and syncs the data_stream.* event fields if they are missing from the event. This ensures that fields match the name of the data stream that is receiving events."
-						required:    false
-						warnings: []
-						type: bool: default: true
-					}
-					type: {
-						common:      false
-						description: "The data stream type used to construct the data stream at index time."
-						required:    false
-						warnings: []
-						type: string: {
-							default: "logs"
-							examples: ["logs", "metrics", "synthetics", "{{ type }}"]
-							syntax: "template"
-						}
-					}
-				}
-			}
-		}
-		doc_type: {
-			common:      false
-			description: "The `doc_type` for your index data. This is only relevant for Elasticsearch <= 6.X. If you are using >= 7.0 you do not need to set this option since Elasticsearch has removed it."
-			required:    false
-			warnings: []
-			type: string: {
-				default: "_doc"
-				syntax:  "literal"
-			}
-		}
-		endpoint: {
-			description: "The Elasticsearch endpoint to send logs to. This should be the full URL as shown in the example."
-			required:    true
-			warnings: []
-			type: string: {
-				examples: ["http://10.24.32.122:9000", "https://example.com", "https://user:password@example.com"]
-				syntax: "literal"
-			}
-		}
-		id_key: {
-			common:      false
-			description: "The name of the event key that should map to Elasticsearch's [`_id` field](\(urls.elasticsearch_id_field)). By default, Vector does not set the `_id` field, which allows Elasticsearch to set this automatically. You should think carefully about setting your own Elasticsearch IDs, since this can [hinder performance](\(urls.elasticsearch_id_performance))."
-			required:    false
-			warnings: []
-			type: string: {
-				default: null
-				examples: ["id", "_id"]
-				syntax: "literal"
-			}
-		}
-		index: {
-			common:      true
-			description: "Index name to write events to."
-			required:    false
-			warnings: ["This option has been deprecated, the `normal.index` option should be used."]
-			type: string: {
-				default: "vector-%F"
-				examples: ["application-{{ application_id }}-%Y-%m-%d", "vector-%Y-%m-%d"]
-				syntax: "template"
-			}
-		}
-		metrics: {
-			common:      false
-			description: "Options for metrics."
-			required:    false
-			warnings: []
-			type: object: {
-				examples: []
-				options: {
-					host_tag: {
-						common:      false
-						description: "Tag key that identifies the source host."
-						required:    false
-						warnings: []
-						type: string: {
-							default: "hostname"
-							examples: ["host", "hostname"]
-							syntax: "literal"
-						}
-					}
-					timezone: configuration._timezone
-				}
-			}
-		}
-		mode: {
-			common:      true
-			description: "The type of index mechanism. If `data_stream` mode is enabled, the `bulk.action` is set to `create`."
-			required:    false
-			warnings: []
-			type: string: {
-				default: "bulk"
-				examples: ["bulk", "data_stream"]
-				syntax: "literal"
-			}
-		}
-		pipeline: {
-			common:      true
-			description: "Name of the pipeline to apply."
-			required:    false
-			warnings: []
-			type: string: {
-				default: null
-				examples: ["pipeline-name"]
-				syntax: "literal"
-			}
-		}
-		query: {
-			common:      false
-			description: "Custom parameters to Elasticsearch query string."
-			required:    false
-			warnings: []
-			type: object: {
-				examples: [{"X-Powered-By": "Vector"}]
-				options: {}
-			}
-		}
-	}
+	configuration: base.components.sinks.elasticsearch.configuration
 
 	input: {
 		logs:    true
 		metrics: null
+		traces:  false
 	}
 
 	how_it_works: {
@@ -369,8 +89,11 @@ components: sinks: elasticsearch: {
 				Vector [batches](#buffers-and-batches) data and flushes it to Elasticsearch's
 				[`_bulk` API endpoint](\(urls.elasticsearch_bulk)). By default, all events are
 				inserted via the `index` action, which replaces documents if an existing
-				one has the same `id`. If `bulk_action` is configured with `create`, Elasticsearch
+				one has the same `id`. If `bulk.action` is configured with `create`, Elasticsearch
 				does _not_ replace an existing document and instead returns a conflict error.
+				When `bulk.action` is set to `update`, the document is updated with several constraints.
+				The message must be added in `.doc` and have `.doc_as_upsert` to true.
+				The `update` operation requires the `id_key` to be set, and the `encoding` field should specify `doc` and `doc_as_upsert` as values.
 				"""
 		}
 
@@ -384,6 +107,21 @@ components: sinks: elasticsearch: {
 				"""
 		}
 
+		distribution: {
+			title: "Distribution"
+			body: """
+				If multiple endpoints are specified in `endpoints` option, events will be distributed among them
+				according to their estimated load with failover.
+
+				Rate limit is applied to the sink as a whole, while concurrency settings manage each endpoint individually.
+
+				Health of endpoints is actively monitored and if an endpoint is deemed unhealthy, Vector will stop sending events to it
+				until it is healthy again. This is managed by a circuit breaker that monitors responses and triggers after a sufficient
+				streak of failures. Once triggered it will enter exponential backoff loop and pass a single request in each iteration
+				to test the endpoint. Once a successful response is received, the circuit breaker will reset.
+				"""
+		}
+
 		partial_failures: {
 			title: "Partial Failures"
 			body:  """
@@ -391,18 +129,12 @@ components: sinks: elasticsearch: {
 				due to Elasticsearch index mapping errors, where data keys aren't consistently
 				typed. To change this behavior, refer to the Elasticsearch [`ignore_malformed`
 				setting](\(urls.elasticsearch_ignore_malformed)).
+
+				By default, partial failures are not retried. To enable retries, set `request_retry_partial`. Once enabled it will
+				retry whole partially failed requests. As such it is advised to use `id_key` to avoid duplicates.
 				"""
 		}
 
 		aws_authentication: components._aws.how_it_works.aws_authentication
-	}
-
-	telemetry: metrics: {
-		component_sent_bytes_total:       components.sources.internal_metrics.output.metrics.component_sent_bytes_total
-		component_sent_events_total:      components.sources.internal_metrics.output.metrics.component_sent_events_total
-		component_sent_event_bytes_total: components.sources.internal_metrics.output.metrics.component_sent_event_bytes_total
-		events_discarded_total:           components.sources.internal_metrics.output.metrics.events_discarded_total
-		events_out_total:                 components.sources.internal_metrics.output.metrics.events_out_total
-		processing_errors_total:          components.sources.internal_metrics.output.metrics.processing_errors_total
 	}
 }

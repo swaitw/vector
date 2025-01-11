@@ -3,14 +3,14 @@ package metadata
 remap: functions: parse_key_value: {
 	category:    "Parse"
 	description: """
-		Parses the `value` in key/value format. Also known as [logfmt](\(urls.logfmt)).
+		Parses the `value` in key-value format. Also known as [logfmt](\(urls.logfmt)).
 
 		* Keys and values can be wrapped with `"`.
 		* `"` characters can be escaped using `\\`.
 		"""
 	notices: [
 		"""
-			All values are returned as strings. We recommend manually coercing values to desired types as you see fit.
+			All values are returned as strings or as an array of strings for duplicate keys. We recommend manually coercing values to desired types as you see fit.
 			""",
 	]
 
@@ -30,7 +30,7 @@ remap: functions: parse_key_value: {
 		},
 		{
 			name:        "field_delimiter"
-			description: "The string that separates each key/value pair."
+			description: "The string that separates each key-value pair."
 			required:    false
 			default:     " "
 			type: ["string"]
@@ -48,14 +48,14 @@ remap: functions: parse_key_value: {
 		},
 		{
 			name:        "accept_standalone_key"
-			description: "Whether a standalone key should be accepted, the resulting object will associate such keys with boolean value `true`"
+			description: "Whether a standalone key should be accepted, the resulting object associates such keys with the boolean value `true`."
 			required:    false
 			type: ["boolean"]
 			default: true
 		},
 	]
 	internal_failure_reasons: [
-		"`value` isn't a properly formatted key/value string",
+		"`value` is not a properly formatted key-value string.",
 	]
 	return: types: ["object"]
 
@@ -111,6 +111,23 @@ remap: functions: parse_key_value: {
 				service: "backend"
 				region:  "eu-east1"
 				beta:    true
+			}
+		},
+		{
+			title: "Parse duplicate keys"
+			source: #"""
+				parse_key_value!(
+					"at=info,method=GET,path=\"/index\",status=200,tags=dev,tags=dummy",
+					field_delimiter: ",",
+					key_value_delimiter: "=",
+				)
+				"""#
+			return: {
+				at:     "info"
+				method: "GET"
+				path:   "/index"
+				status: "200"
+				tags: ["dev", "dummy"]
 			}
 		},
 	]
