@@ -1,40 +1,33 @@
 package metadata
 
 components: sinks: _humio: {
+	_humio_encoding: enabled: false
+
 	classes: {
 		commonly_used: false
 		delivery:      "at_least_once"
-		development:   "beta"
+		development:   "stable"
 		egress_method: "batch"
 		service_providers: ["Humio"]
 		stateful: false
 	}
 
 	support: {
-		targets: {
-			"aarch64-unknown-linux-gnu":      true
-			"aarch64-unknown-linux-musl":     true
-			"armv7-unknown-linux-gnueabihf":  true
-			"armv7-unknown-linux-musleabihf": true
-			"x86_64-apple-darwin":            true
-			"x86_64-pc-windows-msv":          true
-			"x86_64-unknown-linux-gnu":       true
-			"x86_64-unknown-linux-musl":      true
-		}
 		requirements: []
 		warnings: []
 		notices: []
 	}
 
 	features: {
-		buffer: enabled:      true
+		auto_generated:   true
+		acknowledgements: true
 		healthcheck: enabled: true
 		send: {
 			batch: {
 				enabled:      true
 				common:       false
-				max_bytes:    1049000
-				timeout_secs: 1
+				max_bytes:    10_000_000
+				timeout_secs: 1.0
 			}
 			compression: {
 				enabled: true
@@ -42,13 +35,7 @@ components: sinks: _humio: {
 				algorithms: ["gzip"]
 				levels: ["none", "fast", "default", "best", 0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
 			}
-			encoding: {
-				enabled: true
-				codec: {
-					enabled: true
-					enum: ["json", "text"]
-				}
-			}
+			encoding: _humio_encoding
 			proxy: enabled: true
 			request: {
 				enabled:                    true
@@ -61,10 +48,10 @@ components: sinks: _humio: {
 			}
 			tls: {
 				enabled:                true
-				can_enable:             false
 				can_verify_certificate: true
 				can_verify_hostname:    true
-				enabled_default:        false
+				enabled_default:        true
+				enabled_by_scheme:      true
 			}
 			to: {
 				service: services.humio
@@ -92,7 +79,6 @@ components: sinks: _humio: {
 			type: string: {
 				default: "https://cloud.humio.com"
 				examples: ["http://127.0.0.1", "http://example.com"]
-				syntax: "literal"
 			}
 		}
 		event_type: {
@@ -104,7 +90,6 @@ components: sinks: _humio: {
 				If unset, Humio will default it to none.
 				"""
 			required: false
-			warnings: []
 			type: string: {
 				default: null
 				examples: ["json", "none"]
@@ -118,18 +103,15 @@ components: sinks: _humio: {
 				[global `host_key` option](\(urls.vector_configuration)/global-options#log_schema.host_key).
 				"""
 			required:    false
-			warnings: []
 			type: string: {
 				default: null
 				examples: ["hostname"]
-				syntax: "literal"
 			}
 		}
 		index: {
 			common:      false
 			description: "Optional name of the repository to ingest into. In public-facing APIs this must - if present - be equal to the repository used to create the ingest token used for authentication. In private cluster setups, humio can be configured to allow these to be different. For more information, see [Humio's Format of Data](\(urls.humio_hec_format_of_data))."
 			required:    false
-			warnings: []
 			type: string: {
 				default: null
 				examples: ["{{ host }}", "custom_index"]
@@ -140,12 +122,10 @@ components: sinks: _humio: {
 			common:      true
 			description: "Event fields to be added to Humio's extra fields. Can be used to tag events by specifying fields starting with `#`. For more information, see [Humio's Format of Data](\(urls.humio_hec_format_of_data))."
 			required:    false
-			warnings: []
 			type: array: {
 				default: null
 				items: type: string: {
-					examples: ["#env", "#datacenter"]
-					syntax: "literal"
+					examples: ["#env", "\"#datacenter\""]
 				}
 			}
 		}
@@ -156,7 +136,6 @@ components: sinks: _humio: {
 				`@source` in Humio.
 				"""
 			required: false
-			warnings: []
 			type: string: {
 				default: null
 				examples: ["{{file}}", "/var/log/syslog", "UDP:514"]
@@ -166,18 +145,9 @@ components: sinks: _humio: {
 		token: {
 			description: "Your Humio ingestion token."
 			required:    true
-			warnings: []
 			type: string: {
 				examples: ["${HUMIO_TOKEN}", "A94A8FE5CCB19BA61C4C08"]
-				syntax: "literal"
 			}
 		}
-	}
-
-	telemetry: metrics: {
-		component_sent_bytes_total:       components.sources.internal_metrics.output.metrics.component_sent_bytes_total
-		component_sent_events_total:      components.sources.internal_metrics.output.metrics.component_sent_events_total
-		component_sent_event_bytes_total: components.sources.internal_metrics.output.metrics.component_sent_event_bytes_total
-		events_out_total:                 components.sources.internal_metrics.output.metrics.events_out_total
 	}
 }

@@ -1,10 +1,11 @@
 cargo-timing*.html
+*.pyc
 *.iml
 *.tmp
+*~
 **/*.rs.bk
 .DS_Store
-.idea/
-.vscode/
+.dir-locals.el
 checkpoints/*
 miniodat
 bench_output.txt
@@ -15,3 +16,9 @@ node_modules
 tests/data/wasm/*/target
 heaptrack.*
 massif.*
+
+# tilt
+tilt_modules/
+
+# Jetbrains
+.idea/

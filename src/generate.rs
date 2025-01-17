@@ -1,28 +1,30 @@
-use crate::config::{
-    component::ExampleError, SinkDescription, SinkHealthcheckOptions, SourceDescription,
-    TransformDescription,
-};
-use colored::*;
-use indexmap::IndexMap;
-use serde::Serialize;
-use std::path::{Path, PathBuf};
+#![allow(missing_docs)]
 use std::{
     fs::{create_dir_all, File},
     io::Write,
+    path::{Path, PathBuf},
 };
-use structopt::StructOpt;
-use toml::{map::Map, Value};
-use vector_core::config::GlobalOptions;
-use vector_core::default_data_dir;
 
-#[derive(StructOpt, Debug)]
-#[structopt(rename_all = "kebab-case")]
+use clap::Parser;
+use colored::*;
+use indexmap::IndexMap;
+use serde::Serialize;
+use toml::{map::Map, Value};
+use vector_lib::configurable::component::{
+    SinkDescription, SourceDescription, TransformDescription,
+};
+use vector_lib::{buffers::BufferConfig, config::GlobalOptions, default_data_dir};
+
+use crate::config::{format, Format, SinkHealthcheckOptions};
+
+#[derive(Parser, Debug)]
+#[command(rename_all = "kebab-case")]
 pub struct Opts {
     /// Whether to skip the generation of global fields.
-    #[structopt(short, long)]
-    fragment: bool,
+    #[arg(short, long)]
+    pub(crate) fragment: bool,
 
-    /// Generate expression, e.g. 'stdin/json_parser,add_fields/console'
+    /// Generate expression, e.g. 'stdin/remap,filter/console'
     ///
     /// Three comma-separated lists of sources, transforms and sinks, divided by
     /// forward slashes. If subsequent component types are not needed then
@@ -30,7 +32,7 @@ pub struct Opts {
     ///
     /// For example:
     ///
-    /// `/json_parser` prints a `json_parser` transform.
+    /// `/filter` prints a `filter` transform.
     ///
     /// `//file,http` prints a `file` and `http` sink.
     ///
@@ -41,8 +43,8 @@ pub struct Opts {
     /// can optionally specify the names of components by prefixing them with
     /// `<name>:`, e.g.:
     ///
-    /// `foo:stdin/bar:regex_parser/baz:http` prints a `stdin` source called
-    /// `foo`, a `regex_parser` transform called `bar`, and an `http` sink
+    /// `foo:stdin/bar:test_basic/baz:http` prints a `stdin` source called
+    /// `foo`, a `test_basic` transform called `bar`, and an `http` sink
     /// called `baz`.
     ///
     /// Vector makes a best attempt at constructing a sensible topology. The
@@ -51,11 +53,14 @@ pub struct Opts {
     /// from the last transform or, if none are specified, from all sources. It
     /// is then up to you to restructure the `inputs` of each component to build
     /// the topology you need.
-    expression: String,
+    pub(crate) expression: String,
 
     /// Generate config as a file
-    #[structopt(long, parse(from_os_str))]
-    file: Option<PathBuf>,
+    #[arg(long)]
+    pub(crate) file: Option<PathBuf>,
+
+    #[arg(long, default_value = "yaml")]
+    pub(crate) format: Format,
 }
 
 #[derive(Serialize)]
@@ -64,7 +69,7 @@ pub struct SinkOuter {
     #[serde(flatten)]
     pub inner: Value,
     pub healthcheck: SinkHealthcheckOptions,
-    pub buffer: crate::buffers::BufferConfig,
+    pub buffer: BufferConfig,
 }
 
 #[derive(Serialize)]
@@ -76,18 +81,45 @@ pub struct TransformOuter {
 
 #[derive(Serialize, Default)]
 pub struct Config {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub sources: Option<IndexMap<String, Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub transforms: Option<IndexMap<String, TransformOuter>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub sinks: Option<IndexMap<String, SinkOuter>>,
 }
 
-fn generate_example(
-    include_globals: bool,
-    expression: &str,
-    file: &Option<PathBuf>,
+/// Controls how the resulting transform topology is wired up. This is not
+/// user-configurable.
+pub(crate) enum TransformInputsStrategy {
+    /// Default.
+    ///
+    /// The first transform generated will consume from all sources and
+    /// subsequent transforms will consume from their predecessor.
+    Auto,
+    /// Used for property testing `vector config`.
+    ///
+    /// All transforms use a list of all sources as inputs.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    All,
+}
+
+#[derive(Serialize, Default)]
+struct FullConfig {
+    #[serde(flatten)]
+    global_options: Option<GlobalOptions>,
+    #[serde(flatten)]
+    config: Config,
+}
+
+pub(crate) fn generate_example(
+    opts: &Opts,
+    transform_inputs_strategy: TransformInputsStrategy,
 ) -> Result<String, Vec<String>> {
-    let components: Vec<Vec<_>> = expression
-        .split(|c| c == '|' || c == '/')
+    let components: Vec<Vec<_>> = opts
+        .expression
+        .split(['|', '/'])
         .map(|s| {
             s.split(',')
                 .map(|s| s.trim().to_string())
@@ -96,16 +128,12 @@ fn generate_example(
         })
         .collect();
 
-    let globals = GlobalOptions {
-        data_dir: default_data_dir(),
-        ..Default::default()
-    };
     let mut config = Config::default();
 
     let mut errs = Vec::new();
 
     let mut source_names = Vec::new();
-    if let Some(source_types) = components.get(0) {
+    if let Some(source_types) = components.first() {
         let mut sources = IndexMap::new();
 
         for (i, source_expr) in source_types.iter().enumerate() {
@@ -130,12 +158,10 @@ fn generate_example(
             let mut example = match SourceDescription::example(&source_type) {
                 Ok(example) => example,
                 Err(err) => {
-                    if err != ExampleError::MissingExample {
-                        errs.push(format!(
-                            "failed to generate source '{}': {}",
-                            source_type, err
-                        ));
-                    }
+                    errs.push(format!(
+                        "failed to generate source '{}': {}",
+                        source_type, err
+                    ));
                     Value::Table(Map::new())
                 }
             };
@@ -175,24 +201,28 @@ fn generate_example(
             };
             transform_names.push(name.clone());
 
-            let targets = if i == 0 {
-                source_names.clone()
-            } else {
-                vec![transform_names
-                    .get(i - 1)
-                    .unwrap_or(&"component-id".to_owned())
-                    .to_owned()]
+            let targets = match transform_inputs_strategy {
+                TransformInputsStrategy::Auto => {
+                    if i == 0 {
+                        source_names.clone()
+                    } else {
+                        vec![transform_names
+                            .get(i - 1)
+                            .unwrap_or(&"component-id".to_owned())
+                            .to_owned()]
+                    }
+                }
+                #[cfg(test)]
+                TransformInputsStrategy::All => source_names.clone(),
             };
 
             let mut example = match TransformDescription::example(&transform_type) {
                 Ok(example) => example,
                 Err(err) => {
-                    if err != ExampleError::MissingExample {
-                        errs.push(format!(
-                            "failed to generate transform '{}': {}",
-                            transform_type, err
-                        ));
-                    }
+                    errs.push(format!(
+                        "failed to generate transform '{}': {}",
+                        transform_type, err
+                    ));
                     Value::Table(Map::new())
                 }
             };
@@ -239,9 +269,7 @@ fn generate_example(
             let mut example = match SinkDescription::example(&sink_type) {
                 Ok(example) => example,
                 Err(err) => {
-                    if err != ExampleError::MissingExample {
-                        errs.push(format!("failed to generate sink '{}': {}", sink_type, err));
-                    }
+                    errs.push(format!("failed to generate sink '{}': {}", sink_type, err));
                     Value::Table(Map::new())
                 }
             };
@@ -264,7 +292,7 @@ fn generate_example(
                             }
                         })
                         .unwrap_or_else(|| vec!["component-id".to_owned()]),
-                    buffer: crate::buffers::BufferConfig::default(),
+                    buffer: BufferConfig::default(),
                     healthcheck: SinkHealthcheckOptions::default(),
                     inner: example,
                 },
@@ -280,58 +308,37 @@ fn generate_example(
         return Err(errs);
     }
 
-    let mut builder = if include_globals {
-        match toml::to_string(&globals) {
-            Ok(s) => s,
-            Err(err) => {
-                errs.push(format!("failed to marshal globals: {}", err));
-                return Err(errs);
-            }
-        }
-    } else {
-        String::new()
+    let full_config = FullConfig {
+        global_options: if !opts.fragment {
+            Some(GlobalOptions {
+                data_dir: default_data_dir(),
+                ..Default::default()
+            })
+        } else {
+            None
+        },
+        config,
     };
-    if let Some(sources) = config.sources {
-        match toml::to_string(&{
-            Config {
-                sources: Some(sources),
-                ..Default::default()
-            }
-        }) {
-            Ok(v) => builder = [builder, v].join("\n"),
-            Err(e) => errs.push(format!("failed to marshal sources: {}", e)),
-        }
-    }
-    if let Some(transforms) = config.transforms {
-        match toml::to_string(&{
-            Config {
-                transforms: Some(transforms),
-                ..Default::default()
-            }
-        }) {
-            Ok(v) => builder = [builder, v].join("\n"),
-            Err(e) => errs.push(format!("failed to marshal transforms: {}", e)),
-        }
-    }
-    if let Some(sinks) = config.sinks {
-        match toml::to_string(&{
-            Config {
-                sinks: Some(sinks),
-                ..Default::default()
-            }
-        }) {
-            Ok(v) => builder = [builder, v].join("\n"),
-            Err(e) => errs.push(format!("failed to marshal sinks: {}", e)),
-        }
-    }
 
+    let builder = match format::serialize(&full_config, opts.format) {
+        Ok(v) => v,
+        Err(e) => {
+            errs.push(format!("failed to marshal sources: {e}"));
+            return Err(errs);
+        }
+    };
+
+    let file = opts.file.as_ref();
     if file.is_some() {
+        #[allow(clippy::print_stdout)]
         match write_config(file.as_ref().unwrap(), &builder) {
-            Ok(_) => println!(
-                "Config file written to {:?}",
-                &file.as_ref().unwrap().join("\n")
-            ),
-            Err(e) => errs.push(format!("failed to write to file: {}", e)),
+            Ok(_) => {
+                println!(
+                    "Config file written to {:?}",
+                    &file.as_ref().unwrap().join("\n")
+                )
+            }
+            Err(e) => errs.push(format!("failed to write to file: {e}")),
         };
     };
 
@@ -343,19 +350,25 @@ fn generate_example(
 }
 
 pub fn cmd(opts: &Opts) -> exitcode::ExitCode {
-    match generate_example(!opts.fragment, &opts.expression, &opts.file) {
+    match generate_example(opts, TransformInputsStrategy::Auto) {
         Ok(s) => {
-            println!("{}", s);
+            #[allow(clippy::print_stdout)]
+            {
+                println!("{}", s);
+            }
             exitcode::OK
         }
         Err(errs) => {
-            errs.iter().for_each(|e| eprintln!("{}", e.red()));
+            #[allow(clippy::print_stderr)]
+            {
+                errs.iter().for_each(|e| eprintln!("{}", e.red()));
+            }
             exitcode::SOFTWARE
         }
     }
 }
 
-fn write_config(filepath: &Path, body: &str) -> Result<usize, crate::Error> {
+fn write_config(filepath: &Path, body: &str) -> Result<(), crate::Error> {
     if filepath.exists() {
         // If the file exists, we don't want to overwrite, that's just rude.
         Err(format!("{:?} already exists", &filepath).into())
@@ -364,7 +377,7 @@ fn write_config(filepath: &Path, body: &str) -> Result<usize, crate::Error> {
             create_dir_all(directory)?;
         }
         File::create(filepath)
-            .and_then(|mut file| file.write(body.as_bytes()))
+            .and_then(|mut file| file.write_all(body.as_bytes()))
             .map_err(Into::into)
     }
 }
@@ -372,56 +385,61 @@ fn write_config(filepath: &Path, body: &str) -> Result<usize, crate::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(all(feature = "transforms-json_parser", feature = "sinks-console"))]
-    use indoc::indoc;
+    use crate::config::ConfigBuilder;
+    use rstest::rstest;
 
+    fn generate_and_deserialize(expression: String, format: Format) {
+        let opts = Opts {
+            fragment: false,
+            expression,
+            file: None,
+            format,
+        };
+        let cfg_string = generate_example(&opts, TransformInputsStrategy::Auto).unwrap();
+        if let Err(error) = format::deserialize::<ConfigBuilder>(&cfg_string, opts.format) {
+            panic!(
+                "Failed to generate example for {} with error: {error:?})",
+                opts.expression
+            );
+        }
+    }
+
+    #[rstest]
+    #[case(Format::Toml)]
+    #[case(Format::Json)]
+    #[case(Format::Yaml)]
     #[test]
-    fn generate_all() {
-        let mut errors = Vec::new();
-
+    fn generate_all(#[case] format: Format) {
         for name in SourceDescription::types() {
-            let param = format!("{}//", name);
-            let cfg = generate_example(true, &param, &None).unwrap();
-            if let Err(error) = toml::from_str::<crate::config::ConfigBuilder>(&cfg) {
-                errors.push((param, error));
-            }
+            generate_and_deserialize(format!("{}//", name), format);
         }
 
         for name in TransformDescription::types() {
-            let param = format!("/{}/", name);
-            let cfg = generate_example(true, &param, &None).unwrap();
-            if let Err(error) = toml::from_str::<crate::config::ConfigBuilder>(&cfg) {
-                errors.push((param, error));
-            }
+            generate_and_deserialize(format!("/{}/", name), format);
         }
 
         for name in SinkDescription::types() {
-            let param = format!("//{}", name);
-            let cfg = generate_example(true, &param, &None).unwrap();
-            if let Err(error) = toml::from_str::<crate::config::ConfigBuilder>(&cfg) {
-                errors.push((param, error));
-            }
+            generate_and_deserialize(format!("//{}", name), format);
         }
-
-        for (component, error) in &errors {
-            println!("{:?} : {}", component, error);
-        }
-        assert!(errors.is_empty());
     }
 
-    #[cfg(all(
-        feature = "sources-stdin",
-        feature = "transforms-json_parser",
-        feature = "sinks-console"
-    ))]
+    #[cfg(all(feature = "sources-stdin", feature = "sinks-console"))]
     #[test]
     fn generate_configfile() {
         use std::fs;
+
         use tempfile::tempdir;
 
         let tempdir = tempdir().expect("Unable to create tempdir for config");
         let filepath = tempdir.path().join("./config.example.toml");
-        let cfg = generate_example(true, "stdin/json_parser/console", &Some(filepath.clone()));
+        let opts = Opts {
+            fragment: false,
+            expression: "stdin/test_basic/console".to_string(),
+            file: Some(filepath.clone()),
+            format: Format::Toml,
+        };
+
+        let cfg = generate_example(&opts, TransformInputsStrategy::Auto);
         let filecontents = fs::read_to_string(
             fs::canonicalize(&filepath).expect("Could not return canonicalized filepath"),
         )
@@ -430,12 +448,19 @@ mod tests {
         assert_eq!(cfg.unwrap(), filecontents)
     }
 
-    #[cfg(all(feature = "transforms-json_parser", feature = "sinks-console"))]
+    #[cfg(all(feature = "sources-stdin", feature = "sinks-console"))]
     #[test]
-    fn generate_basic() {
+    fn generate_basic_toml() {
+        let mut opts = Opts {
+            fragment: false,
+            expression: "stdin/test_basic/console".to_string(),
+            file: None,
+            format: Format::Toml,
+        };
+
         assert_eq!(
-            generate_example(true, "stdin/json_parser/console", &None),
-            Ok(indoc! {r#"data_dir = "/var/lib/vector/"
+            generate_example(&opts, TransformInputsStrategy::Auto),
+            Ok(indoc::indoc! {r#"data_dir = "/var/lib/vector/"
 
                 [sources.source0]
                 max_length = 102400
@@ -444,14 +469,11 @@ mod tests {
                 [sources.source0.decoding]
                 codec = "bytes"
 
-                [sources.source0.framing]
-                method = "newline_delimited"
-
                 [transforms.transform0]
                 inputs = ["source0"]
-                drop_field = true
-                drop_invalid = false
-                type = "json_parser"
+                increase = 0.0
+                suffix = ""
+                type = "test_basic"
 
                 [sinks.sink0]
                 inputs = ["transform0"]
@@ -461,6 +483,9 @@ mod tests {
                 [sinks.sink0.encoding]
                 codec = "json"
 
+                [sinks.sink0.encoding.json]
+                pretty = false
+
                 [sinks.sink0.healthcheck]
                 enabled = true
 
@@ -472,9 +497,10 @@ mod tests {
             .to_string())
         );
 
+        opts.expression = "stdin|test_basic|console".to_string();
         assert_eq!(
-            generate_example(true, "stdin|json_parser|console", &None),
-            Ok(indoc! {r#"data_dir = "/var/lib/vector/"
+            generate_example(&opts, TransformInputsStrategy::Auto),
+            Ok(indoc::indoc! {r#"data_dir = "/var/lib/vector/"
 
                 [sources.source0]
                 max_length = 102400
@@ -483,14 +509,11 @@ mod tests {
                 [sources.source0.decoding]
                 codec = "bytes"
 
-                [sources.source0.framing]
-                method = "newline_delimited"
-
                 [transforms.transform0]
                 inputs = ["source0"]
-                drop_field = true
-                drop_invalid = false
-                type = "json_parser"
+                increase = 0.0
+                suffix = ""
+                type = "test_basic"
 
                 [sinks.sink0]
                 inputs = ["transform0"]
@@ -500,6 +523,9 @@ mod tests {
                 [sinks.sink0.encoding]
                 codec = "json"
 
+                [sinks.sink0.encoding.json]
+                pretty = false
+
                 [sinks.sink0.healthcheck]
                 enabled = true
 
@@ -511,9 +537,10 @@ mod tests {
             .to_string())
         );
 
+        opts.expression = "stdin//console".to_string();
         assert_eq!(
-            generate_example(true, "stdin//console", &None),
-            Ok(indoc! {r#"data_dir = "/var/lib/vector/"
+            generate_example(&opts, TransformInputsStrategy::Auto),
+            Ok(indoc::indoc! {r#"data_dir = "/var/lib/vector/"
 
                 [sources.source0]
                 max_length = 102400
@@ -521,9 +548,6 @@ mod tests {
 
                 [sources.source0.decoding]
                 codec = "bytes"
-
-                [sources.source0.framing]
-                method = "newline_delimited"
 
                 [sinks.sink0]
                 inputs = ["source0"]
@@ -533,6 +557,9 @@ mod tests {
                 [sinks.sink0.encoding]
                 codec = "json"
 
+                [sinks.sink0.encoding.json]
+                pretty = false
+
                 [sinks.sink0.healthcheck]
                 enabled = true
 
@@ -544,9 +571,10 @@ mod tests {
             .to_string())
         );
 
+        opts.expression = "//console".to_string();
         assert_eq!(
-            generate_example(true, "//console", &None),
-            Ok(indoc! {r#"data_dir = "/var/lib/vector/"
+            generate_example(&opts, TransformInputsStrategy::Auto),
+            Ok(indoc::indoc! {r#"data_dir = "/var/lib/vector/"
 
                 [sinks.sink0]
                 inputs = ["component-id"]
@@ -556,6 +584,9 @@ mod tests {
                 [sinks.sink0.encoding]
                 codec = "json"
 
+                [sinks.sink0.encoding.json]
+                pretty = false
+
                 [sinks.sink0.healthcheck]
                 enabled = true
 
@@ -567,54 +598,189 @@ mod tests {
             .to_string())
         );
 
+        opts.expression = "/test_basic,test_basic,test_basic".to_string();
         assert_eq!(
-            generate_example(true, "/add_fields,json_parser,remove_fields", &None),
-            Ok(indoc! {r#"data_dir = "/var/lib/vector/"
+            generate_example(&opts, TransformInputsStrategy::Auto),
+            Ok(indoc::indoc! {r#"data_dir = "/var/lib/vector/"
 
                 [transforms.transform0]
                 inputs = []
-                type = "add_fields"
-
-                [transforms.transform0.fields]
-                name = "field_name"
+                increase = 0.0
+                suffix = ""
+                type = "test_basic"
 
                 [transforms.transform1]
                 inputs = ["transform0"]
-                drop_field = true
-                drop_invalid = false
-                type = "json_parser"
+                increase = 0.0
+                suffix = ""
+                type = "test_basic"
 
                 [transforms.transform2]
                 inputs = ["transform1"]
-                fields = []
-                type = "remove_fields"
+                increase = 0.0
+                suffix = ""
+                type = "test_basic"
             "#}
             .to_string())
         );
 
+        opts.fragment = true;
+        opts.expression = "/test_basic,test_basic,test_basic".to_string();
         assert_eq!(
-            generate_example(false, "/add_fields,json_parser,remove_fields", &None),
-            Ok(indoc! {r#"
-
+            generate_example(&opts, TransformInputsStrategy::Auto),
+            Ok(indoc::indoc! {r#"
                 [transforms.transform0]
                 inputs = []
-                type = "add_fields"
-
-                [transforms.transform0.fields]
-                name = "field_name"
+                increase = 0.0
+                suffix = ""
+                type = "test_basic"
 
                 [transforms.transform1]
                 inputs = ["transform0"]
-                drop_field = true
-                drop_invalid = false
-                type = "json_parser"
+                increase = 0.0
+                suffix = ""
+                type = "test_basic"
 
                 [transforms.transform2]
                 inputs = ["transform1"]
-                fields = []
-                type = "remove_fields"
+                increase = 0.0
+                suffix = ""
+                type = "test_basic"
             "#}
             .to_string())
+        );
+    }
+
+    #[cfg(all(
+        feature = "sources-demo_logs",
+        feature = "transforms-remap",
+        feature = "sinks-console"
+    ))]
+    #[test]
+    fn generate_basic_yaml() {
+        let opts = Opts {
+            fragment: false,
+            expression: "demo_logs/remap/console".to_string(),
+            file: None,
+            format: Format::Yaml,
+        };
+
+        assert_eq!(
+            generate_example(&opts, TransformInputsStrategy::Auto).unwrap(),
+            indoc::indoc! {r"
+            data_dir: /var/lib/vector/
+            sources:
+              source0:
+                count: 9223372036854775807
+                format: json
+                interval: 1.0
+                type: demo_logs
+                decoding:
+                  codec: bytes
+                framing:
+                  method: bytes
+            transforms:
+              transform0:
+                inputs:
+                - source0
+                drop_on_abort: false
+                drop_on_error: false
+                metric_tag_values: single
+                reroute_dropped: false
+                runtime: ast
+                type: remap
+            sinks:
+              sink0:
+                inputs:
+                - transform0
+                target: stdout
+                type: console
+                encoding:
+                  codec: json
+                  json:
+                    pretty: false
+                healthcheck:
+                  enabled: true
+                  uri: null
+                buffer:
+                  type: memory
+                  max_events: 500
+                  when_full: block
+            "}
+        );
+    }
+
+    #[cfg(all(
+        feature = "sources-demo_logs",
+        feature = "transforms-remap",
+        feature = "sinks-console"
+    ))]
+    #[test]
+    fn generate_basic_json() {
+        let opts = Opts {
+            fragment: false,
+            expression: "demo_logs/remap/console".to_string(),
+            file: None,
+            format: Format::Json,
+        };
+
+        assert_eq!(
+            generate_example(&opts, TransformInputsStrategy::Auto).unwrap(),
+            indoc::indoc! {r#"
+            {
+              "data_dir": "/var/lib/vector/",
+              "sources": {
+                "source0": {
+                  "count": 9223372036854775807,
+                  "format": "json",
+                  "interval": 1.0,
+                  "type": "demo_logs",
+                  "decoding": {
+                    "codec": "bytes"
+                  },
+                  "framing": {
+                    "method": "bytes"
+                  }
+                }
+              },
+              "transforms": {
+                "transform0": {
+                  "inputs": [
+                    "source0"
+                  ],
+                  "drop_on_abort": false,
+                  "drop_on_error": false,
+                  "metric_tag_values": "single",
+                  "reroute_dropped": false,
+                  "runtime": "ast",
+                  "type": "remap"
+                }
+              },
+              "sinks": {
+                "sink0": {
+                  "inputs": [
+                    "transform0"
+                  ],
+                  "target": "stdout",
+                  "type": "console",
+                  "encoding": {
+                    "codec": "json",
+                    "json": {
+                      "pretty": false
+                    }
+                  },
+                  "healthcheck": {
+                    "enabled": true,
+                    "uri": null
+                  },
+                  "buffer": {
+                    "type": "memory",
+                    "max_events": 500,
+                    "when_full": "block"
+                  }
+                }
+              }
+            }"#}
         );
     }
 }

@@ -1,10 +1,12 @@
-use crate::file_watcher::tests::*;
-use crate::file_watcher::FileWatcher;
-use crate::ReadFrom;
+use std::{fs, io::Write};
+
 use bytes::Bytes;
 use quickcheck::{QuickCheck, TestResult};
-use std::fs;
-use std::io::Write;
+
+use crate::{
+    file_watcher::{tests::*, FileWatcher},
+    ReadFrom,
+};
 
 // Interpret all FWActions, excluding truncation
 //
@@ -30,7 +32,8 @@ fn experiment_no_truncations(actions: Vec<FileWatcherAction>) {
     for action in actions.iter() {
         match *action {
             FileWatcherAction::DeleteFile => {
-                let _ = fs::remove_file(&path);
+                _ = fs::remove_file(&path);
+                #[cfg(not(windows))] // Windows will only remove after the file is closed.
                 assert!(!path.exists());
                 fwfiles[0].reset();
                 break;
@@ -40,8 +43,8 @@ fn experiment_no_truncations(actions: Vec<FileWatcherAction>) {
             FileWatcherAction::Exit => break,
             FileWatcherAction::WriteLine(ref s) => {
                 fwfiles[0].write_line(s);
-                assert!(fp.write(s.as_bytes()).is_ok());
-                assert!(fp.write(b"\n").is_ok());
+                assert!(fp.write_all(s.as_bytes()).is_ok());
+                assert!(fp.write_all(b"\n").is_ok());
                 assert!(fp.flush().is_ok());
             }
             FileWatcherAction::RotateFile => {
@@ -60,7 +63,7 @@ fn experiment_no_truncations(actions: Vec<FileWatcherAction>) {
                         Err(_) => {
                             unreachable!();
                         }
-                        Ok(Some(line)) if line.is_empty() => {
+                        Ok(Some(line)) if line.bytes.is_empty() => {
                             attempts -= 1;
                             assert!(fwfiles[read_index].read_line().is_none());
                             continue;
@@ -72,7 +75,7 @@ fn experiment_no_truncations(actions: Vec<FileWatcherAction>) {
                         }
                         Ok(Some(line)) => {
                             let exp = fwfiles[read_index].read_line().expect("could not readline");
-                            assert_eq!(exp.into_bytes(), line);
+                            assert_eq!(exp.into_bytes(), line.bytes);
                             // assert_eq!(sz, buf.len() + 1);
                             break;
                         }

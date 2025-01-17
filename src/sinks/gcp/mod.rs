@@ -1,201 +1,47 @@
-use crate::{
-    config::ProxyConfig,
-    http::{HttpClient, HttpError},
-    sinks::HealthcheckError,
-};
-use futures::StreamExt;
-use goauth::scopes::Scope;
-use goauth::{
-    auth::{JwtClaims, Token, TokenErr},
-    credentials::Credentials,
-    GoErr,
-};
-use hyper::{header::AUTHORIZATION, StatusCode};
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
-use smpl_jwt::Jwt;
-use snafu::{ResultExt, Snafu};
-use std::sync::{Arc, RwLock};
-use std::time::Duration;
-use tokio_stream::wrappers::IntervalStream;
+use vector_lib::configurable::configurable_component;
 
 pub mod cloud_storage;
 pub mod pubsub;
-pub mod stackdriver_logs;
-pub mod stackdriver_metrics;
+pub mod stackdriver;
 
-const SERVICE_ACCOUNT_TOKEN_URL: &str =
-    "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token";
-
-#[derive(Debug, Snafu)]
-enum GcpError {
-    #[snafu(display("This requires one of api_key or credentials_path to be defined"))]
-    MissingAuth,
-    #[snafu(display("Invalid GCP credentials"))]
-    InvalidCredentials0,
-    #[snafu(display("Invalid GCP credentials"))]
-    InvalidCredentials1 { source: GoErr },
-    #[snafu(display("Invalid RSA key in GCP credentials"))]
-    InvalidRsaKey { source: GoErr },
-    #[snafu(display("Failed to get OAuth token"))]
-    GetToken { source: GoErr },
-    #[snafu(display("Failed to get OAuth token text"))]
-    GetTokenBytes { source: hyper::Error },
-    #[snafu(display("Failed to get implicit GCP token"))]
-    GetImplicitToken { source: HttpError },
-    #[snafu(display("Failed to parse OAuth token JSON"))]
-    TokenFromJson { source: TokenErr },
-    #[snafu(display("Failed to parse OAuth token JSON text"))]
-    TokenJsonFromStr { source: serde_json::Error },
-    #[snafu(display("Failed to build HTTP client"))]
-    BuildHttpClient { source: HttpError },
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-pub struct GcpAuthConfig {
-    pub api_key: Option<String>,
-    pub credentials_path: Option<String>,
-}
-
-impl GcpAuthConfig {
-    pub async fn make_credentials(&self, scope: Scope) -> crate::Result<Option<GcpCredentials>> {
-        let gap = std::env::var("GOOGLE_APPLICATION_CREDENTIALS").ok();
-        let creds_path = self.credentials_path.as_ref().or_else(|| gap.as_ref());
-        Ok(match (&creds_path, &self.api_key) {
-            (Some(path), _) => Some(GcpCredentials::from_file(path, scope).await?),
-            (None, Some(_)) => None,
-            (None, None) => Some(GcpCredentials::new_implicit(scope).await?),
-        })
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct GcpCredentials {
-    creds: Option<Credentials>,
-    scope: Scope,
-    token: Arc<RwLock<Token>>,
-}
-
-async fn get_token_implicit() -> Result<Token, GcpError> {
-    let req = http::Request::get(SERVICE_ACCOUNT_TOKEN_URL)
-        .header("Metadata-Flavor", "Google")
-        .body(hyper::Body::empty())
-        .unwrap();
-
-    let proxy = ProxyConfig::from_env();
-    let res = HttpClient::new(None, &proxy)
-        .context(BuildHttpClient)?
-        .send(req)
-        .await
-        .context(GetImplicitToken)?;
-
-    let body = res.into_body();
-    let bytes = hyper::body::to_bytes(body).await.context(GetTokenBytes)?;
-
-    // Token::from_str is irresponsible and may panic!
-    match serde_json::from_slice::<Token>(&bytes) {
-        Ok(token) => Ok(token),
-        Err(error) => Err(match serde_json::from_slice::<TokenErr>(&bytes) {
-            Ok(error) => GcpError::TokenFromJson { source: error },
-            Err(_) => GcpError::TokenJsonFromStr { source: error },
-        }),
-    }
-}
-
-impl GcpCredentials {
-    async fn from_file(path: &str, scope: Scope) -> crate::Result<Self> {
-        let creds = Credentials::from_file(path).context(InvalidCredentials1)?;
-        let jwt = make_jwt(&creds, &scope)?;
-        let token = goauth::get_token(&jwt, &creds).await.context(GetToken)?;
-        Ok(Self {
-            creds: Some(creds),
-            scope,
-            token: Arc::new(RwLock::new(token)),
-        })
-    }
-
-    async fn new_implicit(scope: Scope) -> crate::Result<Self> {
-        let token = get_token_implicit().await?;
-        Ok(Self {
-            creds: None,
-            scope,
-            token: Arc::new(RwLock::new(token)),
-        })
-    }
-
-    pub fn apply<T>(&self, request: &mut http::Request<T>) {
-        let token = self.token.read().unwrap();
-        let value = format!("{} {}", token.token_type(), token.access_token());
-        request
-            .headers_mut()
-            .insert(AUTHORIZATION, value.parse().unwrap());
-    }
-
-    async fn regenerate_token(&self) -> crate::Result<()> {
-        let token = match &self.creds {
-            Some(creds) => {
-                let jwt = make_jwt(creds, &self.scope).unwrap(); // Errors caught above
-                goauth::get_token(&jwt, creds).await?
-            }
-            None => get_token_implicit().await?,
-        };
-        *self.token.write().unwrap() = token;
-        Ok(())
-    }
-
-    pub fn spawn_regenerate_token(&self) {
-        let this = self.clone();
-
-        let period = this.token.read().unwrap().expires_in() as u64 / 2;
-        let interval = IntervalStream::new(tokio::time::interval(Duration::from_secs(period)));
-        let task = interval.for_each(move |_| {
-            let this = this.clone();
-            async move {
-                debug!("Renewing GCP authentication token.");
-                if let Err(error) = this.regenerate_token().await {
-                    error!(
-                        message = "Failed to update GCP authentication token.",
-                        %error
-                    );
-                }
-            }
-        });
-        tokio::spawn(task);
-    }
-}
-
-fn make_jwt(creds: &Credentials, scope: &Scope) -> crate::Result<Jwt<JwtClaims>> {
-    let claims = JwtClaims::new(creds.iss(), scope, creds.token_uri(), None, None);
-    let rsa_key = creds.rsa_key().context(InvalidRsaKey)?;
-    Ok(Jwt::new(claims, rsa_key, None))
-}
-
-// Use this to map a healthcheck response, as it handles setting up the renewal task.
-pub fn healthcheck_response(
-    creds: Option<GcpCredentials>,
-    not_found_error: crate::Error,
-) -> impl FnOnce(http::Response<hyper::Body>) -> crate::Result<()> {
-    move |response| match response.status() {
-        StatusCode::OK => {
-            // If there are credentials configured, the
-            // generated OAuth token needs to be periodically
-            // regenerated. Since the health check runs at
-            // startup, after a successful health check is a
-            // good place to create the regeneration task.
-            if let Some(creds) = creds {
-                creds.spawn_regenerate_token();
-            }
-            Ok(())
-        }
-        StatusCode::FORBIDDEN => Err(GcpError::InvalidCredentials0.into()),
-        StatusCode::NOT_FOUND => Err(not_found_error),
-        status => Err(HealthcheckError::UnexpectedStatus { status }.into()),
-    }
-}
-
-#[derive(Deserialize, Serialize, Debug, Clone, Default)]
+/// A monitored resource.
+///
+/// Monitored resources in GCP allow associating logs and metrics specifically with native resources
+/// within Google Cloud Platform. This takes the form of a "type" field which identifies the
+/// resource, and a set of type-specific labels to uniquely identify a resource of that type.
+///
+/// See [Monitored resource types][mon_docs] for more information.
+///
+/// [mon_docs]: https://cloud.google.com/monitoring/api/resources
+#[configurable_component]
+#[derive(Clone, Debug, Default)]
 pub struct GcpTypedResource {
+    /// The monitored resource type.
+    ///
+    /// For example, the type of a Compute Engine VM instance is `gce_instance`.
+    #[configurable(metadata(docs::examples = "global", docs::examples = "gce_instance"))]
     pub r#type: String,
-    pub labels: std::collections::HashMap<String, String>,
+
+    /// Type-specific labels.
+    #[serde(flatten)]
+    #[configurable(metadata(
+        docs::additional_props_description = "Values for all of the labels listed in the associated monitored resource descriptor.\n\nFor example, Compute Engine VM instances use the labels `projectId`, `instanceId`, and `zone`."
+    ))]
+    #[configurable(metadata(docs::examples = "label_examples()"))]
+    pub labels: HashMap<String, String>,
+}
+
+fn label_examples() -> HashMap<String, String> {
+    let mut example = HashMap::new();
+    example.insert("type".to_string(), "global".to_string());
+    example.insert("projectId".to_string(), "vector-123456".to_string());
+    example.insert("instanceId".to_string(), "Twilight".to_string());
+    example.insert("zone".to_string(), "us-central1-a".to_string());
+
+    example
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, Copy)]
@@ -241,18 +87,32 @@ pub struct GcpPointValue {
 
 #[derive(Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
-pub struct GcpSerie<'a> {
-    pub metric: GcpTypedResource,
-    pub resource: GcpTypedResource,
+pub struct GcpMetric {
+    pub r#type: String,
+    pub labels: HashMap<String, String>,
+}
+
+#[derive(Serialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct GcpResource {
+    pub r#type: String,
+    pub labels: HashMap<String, String>,
+}
+
+#[derive(Serialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct GcpSerie {
+    pub metric: GcpMetric,
+    pub resource: GcpResource,
     pub metric_kind: GcpMetricKind,
     pub value_type: GcpValueType,
-    pub points: &'a [GcpPoint],
+    pub points: Vec<GcpPoint>,
 }
 
 #[derive(Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct GcpSeries<'a> {
-    time_series: &'a [GcpSerie<'a>],
+    time_series: &'a [GcpSerie],
 }
 
 fn serialize_int64_value<S>(value: &Option<i64>, serializer: S) -> Result<S::Ok, S::Error>
@@ -289,15 +149,53 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::assert_downcast_matches;
+    use chrono::TimeZone;
 
-    #[tokio::test]
-    #[ignore]
-    async fn fails_missing_creds() {
-        let config: GcpAuthConfig = toml::from_str("").unwrap();
-        match config.make_credentials(Scope::Compute).await {
-            Ok(_) => panic!("make_credentials failed to error"),
-            Err(err) => assert_downcast_matches!(err, GcpError, GcpError::GetImplicitToken { .. }), // This should be a more relevant error
-        }
+    /// Ensures that serialized `GcpSeries` matches the format that GCP expects (https://cloud.google.com/monitoring/api/ref_v3/rest/v3/TimeSeries).
+    #[test]
+    fn serialize_gcp_series() {
+        let end_time = chrono::Utc
+            .with_ymd_and_hms(2023, 2, 14, 10, 0, 0)
+            .single()
+            .expect("invalid timestamp");
+        let gcp_series = GcpSeries {
+            time_series: &[GcpSerie {
+                metric: GcpMetric {
+                    r#type: "custom.googleapis.com/my_namespace/metrics/my_metric".to_string(),
+                    labels: [(
+                        "my_metric_label".to_string(),
+                        "my_metric_label_value".to_string(),
+                    )]
+                    .into(),
+                },
+                resource: GcpResource {
+                    r#type: "my_resource".to_string(),
+                    labels: [(
+                        "my_resource_label".to_string(),
+                        "my_resource_label_value".to_string(),
+                    )]
+                    .into(),
+                },
+                metric_kind: GcpMetricKind::Gauge,
+                value_type: GcpValueType::Int64,
+                points: vec![GcpPoint {
+                    interval: GcpInterval {
+                        start_time: None,
+                        end_time,
+                    },
+                    value: GcpPointValue {
+                        int64_value: Some(10),
+                    },
+                }],
+            }],
+        };
+
+        let serialized = serde_json::to_string(&gcp_series).unwrap();
+
+        // Convert to `serde_json::Value` so that field order does not matter.
+        let value: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+        let expected: serde_json::Value = serde_json::from_str(r#"{"timeSeries":[{"metric":{"type":"custom.googleapis.com/my_namespace/metrics/my_metric","labels":{"my_metric_label":"my_metric_label_value"}},"resource":{"type":"my_resource","labels":{"my_resource_label":"my_resource_label_value"}},"metricKind":"GAUGE","valueType": "INT64","points":[{"interval":{"endTime":"2023-02-14T10:00:00.000000000Z"},"value":{"int64Value":"10"}}]}]}"#).unwrap();
+
+        assert_eq!(value, expected);
     }
 }

@@ -23,7 +23,7 @@ To manage the Vector executable directly, without a process manager:
 {{< tab title="Start" >}}
 
 ```bash
-vector --config /etc/vector/vector.toml
+vector --config /etc/vector/vector.yaml
 
 # Or supply a JSON or YAML config file
 ```
@@ -40,9 +40,9 @@ killall -s SIGHUP vector
 
 ### Linux
 
-#### APT, dpkg, RPM, YUM
+#### APT, dpkg, RPM, YUM, pacman
 
-If you've installed Vector using [APT], [dpkg], [RPM], or [YUM], you can manage it using [systemctl].
+If you've installed Vector using [APT], [dpkg], [RPM], [YUM] or [pacman], you can manage it using [systemctl].
 
 {{< tabs default="Start" >}}
 {{< tab title="Start" >}}
@@ -129,9 +129,9 @@ If you're running Vector on Windows (perhaps you installed it using [MSI]), you 
 
 ```powershell
 C:\Program Files\Vector\bin\vector \
-  --config C:\Program Files\Vector\config\vector.toml
+  --config C:\Program Files\Vector\config\vector.yaml
 
-# Or supply a JSON or YAML config file
+# Or supply a TOML or JSON config file
 ```
 
 {{< /tab >}}
@@ -147,7 +147,7 @@ If you're running Vector using [Docker], the command interface is the same acros
 ```bash
 docker run \
   -d \
-  -v ~/vector.toml:/etc/vector/vector.toml:ro \
+  -v ~/vector.yaml:/etc/vector/vector.yaml:ro \
   -p 8686:8686 \
   timberio/vector:{{< version >}}-alpine
 ```
@@ -214,13 +214,16 @@ kubectl rollout restart --namespace vector statefulset/vector-aggregator
 
 As you can see above, many administrative interfaces for Vector enable you to trigger a restart of a Vector instance while it's running. There are a few things that you should know about reloading.
 
-### Automatic reloading on config change
+### Automatic reloading on configuration change
 
 You can make Vector automatically reload itself when its [configuration file][configuration] changes by setting the `--watch-config` or `-w` [flag][watch_config] when you first start your Vector instance.
 
-### Automatic reload on configuration change
+Additionally you can add method for watching config change by setting the `--watch-config-method` to `recommended` or `poll`.
 
-Vector provides an option
+`recommended` is default and it uses file event listener for file change events.
+`poll` can used where the event listener won't work, eg. attaching config files by NFS/EFS, which will poll for file changes on certain interval.
+
+You can set the poll interval by setting flag `--watch-config-poll-interval-seconds`. which defaults to `30`.
 
 ## How it works
 
@@ -230,7 +233,7 @@ Running Vector instances accept the IPC [signals](#signals) and produce the [exi
 
 [apt]: /docs/setup/installation/package-managers/apt
 [brew_services]: https://github.com/Homebrew/homebrew-services
-[bug]: https://github.com/timberio/vector/issues/new?labels=type%3A+bug
+[bug]: https://github.com/vectordotdev/vector/issues/new?labels=type%3A+bug
 [configuration]: /docs/reference/configuration
 [docker]: /docs/setup/installation/platforms/docker
 [dpkg]: /docs/setup/installation/package-managers/dpkg
@@ -241,6 +244,7 @@ Running Vector instances accept the IPC [signals](#signals) and produce the [exi
 [msi]: /docs/setup/installation/package-managers/msi
 [nix]: /docs/setup/installation/package-managers/nix
 [rpm]: /docs/setup/installation/package-managers/rpm
+[pacman]: /docs/setup/installation/package-managers/pacman
 [sources]: /docs/reference/configuration/sources
 [systemctl]: https://man7.org/linux/man-pages//man1/systemctl.1.html
 [watch_config]: /docs/reference/cli/#vector-watch-config

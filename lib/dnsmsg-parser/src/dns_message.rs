@@ -1,8 +1,11 @@
+use hickory_proto::op::ResponseCode;
+
+use crate::ede::EDE;
+
 pub(super) const RTYPE_MB: u16 = 7;
 pub(super) const RTYPE_MG: u16 = 8;
 pub(super) const RTYPE_MR: u16 = 9;
 pub(super) const RTYPE_WKS: u16 = 11;
-pub(super) const RTYPE_HINFO: u16 = 13;
 pub(super) const RTYPE_MINFO: u16 = 14;
 pub(super) const RTYPE_RP: u16 = 17;
 pub(super) const RTYPE_AFSDB: u16 = 18;
@@ -29,14 +32,14 @@ pub struct DnsQueryMessage {
     pub answer_section: Vec<DnsRecord>,
     pub authority_section: Vec<DnsRecord>,
     pub additional_section: Vec<DnsRecord>,
-    pub opt_pserdo_section: Option<OptPseudoSection>,
+    pub opt_pseudo_section: Option<OptPseudoSection>,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct QueryHeader {
     pub id: u16,
     pub opcode: u8,
-    pub rcode: u8,
+    pub rcode: ResponseCode,
     pub qr: u8,
     pub aa: bool,
     pub tc: bool,
@@ -65,7 +68,7 @@ pub struct DnsUpdateMessage {
 pub struct UpdateHeader {
     pub id: u16,
     pub opcode: u8,
-    pub rcode: u8,
+    pub rcode: ResponseCode,
     pub qr: u8,
     pub zone_count: u16,
     pub prerequisite_count: u16,
@@ -79,6 +82,7 @@ pub struct OptPseudoSection {
     pub version: u8,
     pub dnssec_ok: bool,
     pub udp_max_payload_size: u16,
+    pub ede: Vec<EDE>,
     pub options: Vec<EdnsOptionEntry>,
 }
 

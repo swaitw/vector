@@ -13,7 +13,8 @@ components: sinks: papertrail: {
 	}
 
 	features: {
-		buffer: enabled:      true
+		auto_generated:   true
+		acknowledgements: true
 		healthcheck: enabled: true
 		send: {
 			compression: enabled: false
@@ -29,10 +30,10 @@ components: sinks: papertrail: {
 			request: enabled:           false
 			tls: {
 				enabled:                true
-				can_enable:             true
 				can_verify_certificate: true
 				can_verify_hostname:    true
 				enabled_default:        true
+				enabled_by_scheme:      false
 			}
 			to: {
 				service: services.papertrail
@@ -53,46 +54,17 @@ components: sinks: papertrail: {
 	}
 
 	support: {
-		targets: {
-			"aarch64-unknown-linux-gnu":      true
-			"aarch64-unknown-linux-musl":     true
-			"armv7-unknown-linux-gnueabihf":  true
-			"armv7-unknown-linux-musleabihf": true
-			"x86_64-apple-darwin":            true
-			"x86_64-pc-windows-msv":          true
-			"x86_64-unknown-linux-gnu":       true
-			"x86_64-unknown-linux-musl":      true
-		}
 		requirements: []
 		warnings: []
 		notices: []
 	}
 
-	configuration: {
-		endpoint: {
-			description: "The endpoint to send logs to."
-			required:    true
-			type: string: {
-				examples: ["logs.papertrailapp.com:12345"]
-				syntax: "literal"
-			}
-		}
-		process: {
-			description: "The value to use as the `process` in Papertrail."
-			common:      true
-			required:    false
-			warnings: []
-			type: string: {
-				default: "vector"
-				examples: ["{{ process }}", "my-process"]
-				syntax: "template"
-			}
-		}
-	}
+	configuration: base.components.sinks.papertrail.configuration
 
 	input: {
 		logs:    true
 		metrics: null
+		traces:  false
 	}
 
 	how_it_works: {

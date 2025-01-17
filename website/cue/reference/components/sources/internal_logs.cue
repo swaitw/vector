@@ -8,12 +8,13 @@ components: sources: internal_logs: {
 		commonly_used: true
 		delivery:      "at_least_once"
 		deployment_roles: ["aggregator", "daemon", "sidecar"]
-		development:   "beta"
+		development:   "stable"
 		egress_method: "stream"
 		stateful:      false
 	}
 
 	features: {
+		acknowledgements: false
 		collect: {
 			checkpoint: enabled: false
 			from: service: {
@@ -27,16 +28,6 @@ components: sources: internal_logs: {
 	}
 
 	support: {
-		targets: {
-			"aarch64-unknown-linux-gnu":      true
-			"aarch64-unknown-linux-musl":     true
-			"armv7-unknown-linux-gnueabihf":  true
-			"armv7-unknown-linux-musleabihf": true
-			"x86_64-apple-darwin":            true
-			"x86_64-pc-windows-msv":          true
-			"x86_64-unknown-linux-gnu":       true
-			"x86_64-unknown-linux-musl":      true
-		}
 		notices: []
 		requirements: []
 		warnings: []
@@ -46,39 +37,7 @@ components: sources: internal_logs: {
 		platform_name: null
 	}
 
-	configuration: {
-		host_key: {
-			category:    "Context"
-			common:      false
-			description: """
-				The key name added to each event representing the current host. This can also be globally set via the
-				[global `host_key` option](\(urls.vector_configuration)/global-options#log_schema.host_key).
-
-				Set to "" to suppress this key.
-				"""
-			required:    false
-			warnings: []
-			type: string: {
-				default: "host"
-				syntax:  "literal"
-			}
-		}
-		pid_key: {
-			category: "Context"
-			common:   false
-			description: """
-				The key name added to each event representing the current process ID.
-
-				Set to "" to suppress this key.
-				"""
-			required: false
-			warnings: []
-			type: string: {
-				default: "pid"
-				syntax:  "literal"
-			}
-		}
-	}
+	configuration: base.components.sources.internal_logs.configuration
 
 	output: logs: line: {
 		description: "An individual log or trace message."
@@ -88,7 +47,13 @@ components: sources: internal_logs: {
 				required:    true
 				type: string: {
 					examples: ["Vector has started."]
-					syntax: "literal"
+				}
+			}
+			source_type: {
+				description: "The name of the source type."
+				required:    true
+				type: string: {
+					examples: ["internal_logs"]
 				}
 			}
 			timestamp: fields._current_timestamp & {
@@ -122,7 +87,6 @@ components: sources: internal_logs: {
 									event: "The call site is an event."
 									span:  "The call site is a span."
 								}
-								syntax: "literal"
 							}
 						}
 						level: {
@@ -136,7 +100,6 @@ components: sources: internal_logs: {
 									WARN:  "Designates hazardous situations."
 									ERROR: "Designates very serious errors."
 								}
-								syntax: "literal"
 							}
 						}
 						module_path: {
@@ -144,7 +107,6 @@ components: sources: internal_logs: {
 							required:    true
 							type: string: {
 								examples: ["vector::internal_events::heartbeat"]
-								syntax: "literal"
 							}
 						}
 						target: {
@@ -152,7 +114,6 @@ components: sources: internal_logs: {
 							required:    true
 							type: string: {
 								examples: ["vector"]
-								syntax: "literal"
 							}
 						}
 					}

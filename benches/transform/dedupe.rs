@@ -1,14 +1,14 @@
-use crate::common::{consume, FixedLogStream};
 use core::fmt;
-use criterion::BenchmarkId;
+use std::{num::NonZeroUsize, time::Duration};
+
 use criterion::{
-    criterion_group, measurement::WallTime, BatchSize, BenchmarkGroup, Criterion, SamplingMode,
-    Throughput,
+    criterion_group, measurement::WallTime, BatchSize, BenchmarkGroup, BenchmarkId, Criterion,
+    SamplingMode, Throughput,
 };
-use std::num::NonZeroUsize;
-use std::time::Duration;
 use vector::transforms::dedupe::{CacheConfig, Dedupe, DedupeConfig, FieldMatchConfig};
-use vector_core::transform::Transform;
+use vector_lib::transform::Transform;
+
+use crate::common::{consume, FixedLogStream};
 
 #[derive(Debug)]
 struct Param {
@@ -32,6 +32,9 @@ fn dedupe(c: &mut Criterion) {
         NonZeroUsize::new(128).unwrap(),
         NonZeroUsize::new(2).unwrap(),
     );
+    let cache = CacheConfig {
+        num_events: NonZeroUsize::new(4).unwrap(),
+    };
     for param in &[
         // Measurement where field "message" is ignored. This field is
         // automatically added by the LogEvent construction mechanism.
@@ -39,10 +42,8 @@ fn dedupe(c: &mut Criterion) {
             slug: "field_ignore_message",
             input: fixed_stream.clone(),
             dedupe_config: DedupeConfig {
-                fields: Some(FieldMatchConfig::IgnoreFields(vec![String::from(
-                    "message",
-                )])),
-                cache: CacheConfig { num_events: 4 },
+                fields: Some(FieldMatchConfig::IgnoreFields(vec!["message".into()])),
+                cache: cache.clone(),
             },
         },
         // Modification of previous where field "message" is matched.
@@ -50,38 +51,38 @@ fn dedupe(c: &mut Criterion) {
             slug: "field_match_message",
             input: fixed_stream.clone(),
             dedupe_config: DedupeConfig {
-                fields: Some(FieldMatchConfig::MatchFields(vec![String::from("message")])),
-                cache: CacheConfig { num_events: 4 },
+                fields: Some(FieldMatchConfig::MatchFields(vec!["message".into()])),
+                cache: cache.clone(),
             },
         },
         // Measurement where ignore fields do not exist in the event.
         Param {
-            slug: "field_ignore_dne",
+            slug: "field_ignore_done",
             input: fixed_stream.clone(),
             dedupe_config: DedupeConfig {
-                cache: CacheConfig { num_events: 4 },
+                cache: cache.clone(),
                 fields: Some(FieldMatchConfig::IgnoreFields(vec![
-                    String::from("abcde"),
-                    String::from("eabcd"),
-                    String::from("deabc"),
-                    String::from("cdeab"),
-                    String::from("bcdea"),
+                    "abcde".into(),
+                    "eabcd".into(),
+                    "deabc".into(),
+                    "cdeab".into(),
+                    "bcdea".into(),
                 ])),
             },
         },
         // Modification of previous where match fields do not exist in the
         // event.
         Param {
-            slug: "field_match_dne",
+            slug: "field_match_done",
             input: fixed_stream.clone(),
             dedupe_config: DedupeConfig {
-                cache: CacheConfig { num_events: 4 },
+                cache,
                 fields: Some(FieldMatchConfig::MatchFields(vec![
-                    String::from("abcde"),
-                    String::from("eabcd"),
-                    String::from("deabc"),
-                    String::from("cdeab"),
-                    String::from("bcdea"),
+                    "abcde".into(),
+                    "eabcd".into(),
+                    "deabc".into(),
+                    "cdeab".into(),
+                    "bcdea".into(),
                 ])),
             },
         },
@@ -91,11 +92,11 @@ fn dedupe(c: &mut Criterion) {
             b.iter_batched(
                 || {
                     let dedupe =
-                        Transform::task(Dedupe::new(param.dedupe_config.clone())).into_task();
+                        Transform::event_task(Dedupe::new(param.dedupe_config.clone())).into_task();
                     (Box::new(dedupe), Box::pin(param.input.clone()))
                 },
                 |(dedupe, input)| {
-                    let output = dedupe.transform(input);
+                    let output = dedupe.transform_events(input);
                     consume(output)
                 },
                 BatchSize::SmallInput,

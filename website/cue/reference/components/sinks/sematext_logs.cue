@@ -13,14 +13,15 @@ components: sinks: sematext_logs: {
 	}
 
 	features: {
-		buffer: enabled:      true
+		acknowledgements: true
+		auto_generated:   true
 		healthcheck: enabled: true
 		send: {
 			batch: {
 				enabled:      true
 				common:       false
-				max_bytes:    10490000
-				timeout_secs: 1
+				max_bytes:    10_000_000
+				timeout_secs: 1.0
 			}
 			compression: enabled: false
 			encoding: {
@@ -38,26 +39,17 @@ components: sinks: sematext_logs: {
 	}
 
 	support: {
-		targets: {
-			"aarch64-unknown-linux-gnu":      true
-			"aarch64-unknown-linux-musl":     true
-			"armv7-unknown-linux-gnueabihf":  true
-			"armv7-unknown-linux-musleabihf": true
-			"x86_64-apple-darwin":            true
-			"x86_64-pc-windows-msv":          true
-			"x86_64-unknown-linux-gnu":       true
-			"x86_64-unknown-linux-musl":      true
-		}
 		requirements: []
 		warnings: []
 		notices: []
 	}
 
-	configuration: sinks._sematext.configuration
+	configuration: base.components.sinks.sematext_logs.configuration
 
 	input: {
 		logs:    true
 		metrics: null
+		traces:  false
 	}
 
 	how_it_works: {

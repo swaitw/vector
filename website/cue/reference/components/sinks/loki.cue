@@ -6,24 +6,30 @@ components: sinks: loki: {
 	classes: {
 		commonly_used: true
 		delivery:      "at_least_once"
-		development:   "beta"
+		development:   "stable"
 		egress_method: "batch"
 		service_providers: ["Grafana"]
 		stateful: false
 	}
 
 	features: {
-		buffer: enabled:      true
+		auto_generated:   true
+		acknowledgements: true
 		healthcheck: enabled: true
 		send: {
 			batch: {
 				enabled:      true
 				common:       false
-				max_bytes:    102400
-				max_events:   100000
-				timeout_secs: 1
+				max_bytes:    1_000_000
+				max_events:   100_000
+				timeout_secs: 1.0
 			}
-			compression: enabled: false
+			compression: {
+				enabled: true
+				default: "snappy"
+				algorithms: ["none", "gzip", "snappy"]
+				levels: ["none", "fast", "default", "best", 0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+			}
 			encoding: {
 				enabled: true
 				codec: {
@@ -38,10 +44,10 @@ components: sinks: loki: {
 			}
 			tls: {
 				enabled:                true
-				can_enable:             false
 				can_verify_certificate: true
 				can_verify_hostname:    true
 				enabled_default:        false
+				enabled_by_scheme:      true
 			}
 			to: {
 				service: services.loki
@@ -58,120 +64,17 @@ components: sinks: loki: {
 	}
 
 	support: {
-		targets: {
-			"aarch64-unknown-linux-gnu":      true
-			"aarch64-unknown-linux-musl":     true
-			"armv7-unknown-linux-gnueabihf":  true
-			"armv7-unknown-linux-musleabihf": true
-			"x86_64-apple-darwin":            true
-			"x86_64-pc-windows-msv":          true
-			"x86_64-unknown-linux-gnu":       true
-			"x86_64-unknown-linux-musl":      true
-		}
 		requirements: []
 		warnings: []
 		notices: []
 	}
 
-	configuration: {
-		endpoint: {
-			description: "The base URL of the Loki instance."
-			required:    true
-			type: string: {
-				examples: ["http://localhost:3100"]
-				syntax: "literal"
-			}
-		}
-		auth: configuration._http_auth & {_args: {
-			password_example: "${LOKI_PASSWORD}"
-			username_example: "${LOKI_USERNAME}"
-		}}
-		labels: {
-			description: """
-				A set of labels that are attached to each batch of events. Both keys and values are templatable, which
-				enables you to attach dynamic labels to events. Note: If the set of labels has high cardinality, this
-				can cause drastic performance issues with Loki. To prevent this from happening, reduce the number of
-				unique label keys and values.
-				"""
-			required: true
-			warnings: []
-			type: object: {
-				examples: [
-					{
-						"forwarder":             "vector"
-						"event":                 "{{ event_field }}"
-						"key":                   "value"
-						"\"{{ event_field }}\"": "{{ another_event_field }}"
-					},
-				]
-				options: {
-					"*": {
-						common:      false
-						description: "Any Loki label, templatable"
-						required:    false
-						type: string: {
-							default: null
-							examples: ["vector", "{{ event_field }}"]
-							syntax: "template"
-						}
-					}
-				}
-			}
-		}
-		out_of_order_action: {
-			common: false
-			description: """
-				Some sources may generate events with timestamps that aren't in strictly chronological order. The Loki
-				service can't accept a stream of such events. Vector sorts events before sending them to Loki, however
-				some late events might arrive after a batch has been sent. This option specifies what Vector should do
-				with those events.
-				"""
-			required: false
-			warnings: []
-			type: string: {
-				syntax:  "literal"
-				default: "drop"
-				enum: {
-					"drop":              "Drop the event, with a warning."
-					"rewrite_timestamp": "Rewrite timestamp of the event to the latest timestamp that was pushed."
-				}
-			}
-		}
-		remove_label_fields: {
-			common:      false
-			description: "If this is set to `true` then when labels are collected from events those fields will also get removed from the event."
-			required:    false
-			warnings: []
-			type: bool: default: false
-		}
-		remove_timestamp: {
-			common:      false
-			description: "If this is set to `true` then the timestamp will be removed from the event payload. Note the event timestamp will still be sent as metadata to Loki for indexing."
-			required:    false
-			warnings: []
-			type: bool: default: true
-		}
-		tenant_id: {
-			common:      false
-			description: """
-				The tenant id that's sent with every request, by default this is not required since a proxy should set
-				this header. When running Loki locally a tenant id is not required either.
-
-				You can read more about tenant id's [here](\(urls.loki_multi_tenancy)).
-				"""
-			required:    false
-			warnings: []
-			type: string: {
-				default: null
-				examples: ["some_tenant_id", "{{ event_field }}"]
-				syntax: "template"
-			}
-		}
-	}
+	configuration: base.components.sinks.loki.configuration
 
 	input: {
 		logs:    true
 		metrics: null
+		traces:  false
 	}
 
 	how_it_works: {
@@ -198,16 +101,64 @@ components: sinks: loki: {
 				increasing timestamp.
 				"""
 		}
+
+		label_expansion: {
+			title: "Label Expansion"
+			body: """
+				The `labels` option can be passed keys with `*` or prefixes ending with `*` to
+				allow for setting multiple keys based on the contents of an object. Static keys
+				override dynamically defined keys. For example, with an object:
+
+				```json
+				{
+					"kubernetes": {
+						"pod_labels": {
+							"app": "web-server",
+							"name": "unicorn"
+						}
+					},
+					"metadata": {
+						"cluster_name": "operations",
+						"cluster_environment": "development",
+						"cluster_version": "1.2.3"
+					}
+				}
+				```
+
+				and a configuration:
+
+				```toml
+				[sinks.my_sink_id.labels]
+				\"pod_labels_*\" = "{{ kubernetes.pod_labels }}"
+				\"*\" = "{{ metadata }}"
+				cluster_name = "static_cluster_name"
+				```
+
+				this would expand into the following labels:
+
+				```yaml
+				pod_labels_app: web-server
+				pod_labels_name: unicorn
+				cluster_name: static_cluster_name
+				cluster_environment: development
+				cluster_version: 1.2.3
+				"""
+		}
+
+		request_encoding: {
+			title: "Request Encoding"
+			body: """
+				Loki can receive log entries as either protobuf or JSON requests.
+				Protobuf requests are snappy compressed. JSON requests have either
+				no compression or can be gzip compressed.
+
+				For the `loki` sink this means the body will be encoded based
+				on the configured `compression`.
+				"""
+		}
 	}
 
 	telemetry: metrics: {
-		component_sent_bytes_total:       components.sources.internal_metrics.output.metrics.component_sent_bytes_total
-		component_sent_events_total:      components.sources.internal_metrics.output.metrics.component_sent_events_total
-		component_sent_event_bytes_total: components.sources.internal_metrics.output.metrics.component_sent_event_bytes_total
-		events_discarded_total:           components.sources.internal_metrics.output.metrics.events_discarded_total
-		events_out_total:                 components.sources.internal_metrics.output.metrics.events_out_total
-		processed_bytes_total:            components.sources.internal_metrics.output.metrics.processed_bytes_total
-		processing_errors_total:          components.sources.internal_metrics.output.metrics.processing_errors_total
-		streams_total:                    components.sources.internal_metrics.output.metrics.streams_total
+		streams_total: components.sources.internal_metrics.output.metrics.streams_total
 	}
 }

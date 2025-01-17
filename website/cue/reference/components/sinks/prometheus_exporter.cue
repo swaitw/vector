@@ -16,12 +16,12 @@ components: sinks: prometheus_exporter: {
 	}
 
 	features: {
-		buffer: enabled:      false
+		auto_generated:   true
+		acknowledgements: true
 		healthcheck: enabled: false
 		exposes: {
 			tls: {
 				enabled:                true
-				can_enable:             true
 				can_verify_certificate: true
 				enabled_default:        false
 			}
@@ -46,16 +46,6 @@ components: sinks: prometheus_exporter: {
 	}
 
 	support: {
-		targets: {
-			"aarch64-unknown-linux-gnu":      true
-			"aarch64-unknown-linux-musl":     true
-			"armv7-unknown-linux-gnueabihf":  true
-			"armv7-unknown-linux-musleabihf": true
-			"x86_64-apple-darwin":            true
-			"x86_64-pc-windows-msv":          true
-			"x86_64-unknown-linux-gnu":       true
-			"x86_64-unknown-linux-musl":      true
-		}
 		requirements: []
 		warnings: [
 			"""
@@ -68,69 +58,7 @@ components: sinks: prometheus_exporter: {
 		notices: []
 	}
 
-	configuration: {
-		address: {
-			description: "The address to expose for scraping."
-			required:    true
-			warnings: []
-			type: string: {
-				examples: ["0.0.0.0:\(_port)"]
-				syntax: "literal"
-			}
-		}
-		buckets: {
-			common:      false
-			description: """
-				Default buckets to use for aggregating [distribution](\(urls.vector_data_model)/metric#distribution)
-				metrics into histograms.
-				"""
-			required:    false
-			warnings: []
-			type: array: {
-				default: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]
-				items: type: float: examples: [0.005, 0.01]
-			}
-		}
-		flush_period_secs: {
-			common:      false
-			description: "Time interval between [set](\(urls.vector_data_model)/metric#set) values are reset."
-			required:    false
-			warnings: []
-			type: uint: {
-				default: 60
-				unit:    "seconds"
-			}
-		}
-		default_namespace: {
-			common:      true
-			description: """
-				Used as a namespace for metrics that don't have it. Typically
-				namespaces are set during ingestion (sources), but it is
-				optional and when missing, we'll use this value. It should
-				follow Prometheus [naming conventions](\(urls.prometheus_metric_naming)).
-				"""
-			required:    false
-			warnings: []
-			type: string: {
-				default: null
-				examples: ["service"]
-				syntax: "literal"
-			}
-		}
-		quantiles: {
-			common:      false
-			description: """
-				Quantiles to use for aggregating [distribution](\(urls.vector_data_model)/metric#distribution) metrics
-				into a summary.
-				"""
-			required:    false
-			warnings: []
-			type: array: {
-				default: [0.5, 0.75, 0.9, 0.95, 0.99]
-				items: type: float: examples: [0.5, 0.75, 0.9, 0.95, 0.99]
-			}
-		}
-	}
+	configuration: base.components.sinks.prometheus_exporter.configuration
 
 	input: {
 		logs: false
@@ -142,6 +70,7 @@ components: sinks: prometheus_exporter: {
 			set:          false
 			summary:      true
 		}
+		traces: false
 	}
 
 	examples: [
@@ -198,24 +127,23 @@ components: sinks: prometheus_exporter: {
 			_host: _values.local_host
 			_name: "response_time_s"
 			title: "Histogram"
-			configuration: {
-			}
+			configuration: {}
 			input: metric: {
 				kind: "absolute"
 				name: _name
 				histogram: {
 					buckets: [
 						{upper_limit: 0.005, count: 0},
-						{upper_limit: 0.01, count:  1},
+						{upper_limit: 0.01, count: 1},
 						{upper_limit: 0.025, count: 0},
-						{upper_limit: 0.05, count:  1},
-						{upper_limit: 0.1, count:   0},
-						{upper_limit: 0.25, count:  0},
-						{upper_limit: 0.5, count:   0},
-						{upper_limit: 1.0, count:   0},
-						{upper_limit: 2.5, count:   0},
-						{upper_limit: 5.0, count:   0},
-						{upper_limit: 10.0, count:  0},
+						{upper_limit: 0.05, count: 1},
+						{upper_limit: 0.1, count: 0},
+						{upper_limit: 0.25, count: 0},
+						{upper_limit: 0.5, count: 0},
+						{upper_limit: 1.0, count: 0},
+						{upper_limit: 2.5, count: 0},
+						{upper_limit: 5.0, count: 0},
+						{upper_limit: 10.0, count: 0},
 					]
 					count: 2
 					sum:   0.789
@@ -318,7 +246,7 @@ components: sinks: prometheus_exporter: {
 				summary: {
 					quantiles: [
 						{upper_limit: 0.01, value: 1.5},
-						{upper_limit: 0.5, value:  2.0},
+						{upper_limit: 0.5, value: 2.0},
 						{upper_limit: 0.99, value: 3.0},
 					]
 					count: 6
@@ -367,7 +295,7 @@ components: sinks: prometheus_exporter: {
 		memory_usage: {
 			title: "Memory Usage"
 			body: """
-				Like other Prometheus instances, the `prometheus` sink aggregates
+				Like other Prometheus instances, the `prometheus_exporter` sink aggregates
 				metrics in memory which keeps the memory footprint to a minimum if Prometheus
 				fails to scrape the Vector instance over an extended period of time. The
 				downside is that data will be lost if Vector is restarted. This is by design of
@@ -375,5 +303,20 @@ components: sinks: prometheus_exporter: {
 				frequently.
 				"""
 		}
+
+		duplicate_tag_names: {
+			title: "Duplicate tag names"
+			body: """
+				Multiple tags with the same name are invalid within Prometheus and Prometheus
+				will reject a metric with duplicate tag names. When sending a tag with multiple
+				values for each name, Vector will only send the last value specified.
+				"""
+		}
+	}
+
+	telemetry: metrics: {
+		http_server_handler_duration_seconds: components.sources.internal_metrics.output.metrics.http_server_handler_duration_seconds
+		http_server_requests_received_total:  components.sources.internal_metrics.output.metrics.http_server_requests_received_total
+		http_server_responses_sent_total:     components.sources.internal_metrics.output.metrics.http_server_responses_sent_total
 	}
 }

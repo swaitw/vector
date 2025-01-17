@@ -1,15 +1,19 @@
-FROM alpine:3.14 AS builder
+FROM docker.io/alpine:3.21 AS builder
 
 WORKDIR /vector
 
 COPY vector-*-unknown-linux-musl*.tar.gz ./
-RUN tar -xvf vector-0*-$(cat /etc/apk/arch)-unknown-linux-musl*.tar.gz --strip-components=2
+RUN tar -xvf vector-0*-"$(cat /etc/apk/arch)"-unknown-linux-musl*.tar.gz --strip-components=2
 
-FROM gcr.io/distroless/static
+RUN mkdir -p /var/lib/vector
+
+# distroless doesn't use static tags
+# hadolint ignore=DL3007
+FROM gcr.io/distroless/static:latest
 
 COPY --from=builder /vector/bin/* /usr/local/bin/
-COPY --from=builder /vector/config/vector.toml /etc/vector/vector.toml
-VOLUME /var/lib/vector/
+COPY --from=builder /vector/config/vector.yaml /etc/vector/vector.yaml
+COPY --from=builder /var/lib/vector /var/lib/vector
 
 # Smoke test
 RUN ["vector", "--version"]

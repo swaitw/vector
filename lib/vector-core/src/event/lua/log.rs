@@ -1,44 +1,29 @@
-use crate::event::{LogEvent, Value};
 use mlua::prelude::*;
 
-impl<'a> ToLua<'a> for LogEvent {
+use super::super::{EventMetadata, LogEvent, Value};
+
+impl IntoLua for LogEvent {
     #![allow(clippy::wrong_self_convention)] // this trait is defined by mlua
-    fn to_lua(self, lua: &'a Lua) -> LuaResult<LuaValue> {
-        let (fields, _metadata) = self.into_parts();
-        // The metadata is handled when converting the enclosing `Event`.
-        lua.create_table_from(fields).map(LuaValue::Table)
+    fn into_lua(self, lua: &Lua) -> LuaResult<LuaValue> {
+        let (value, _metadata) = self.into_parts();
+        value.into_lua(lua)
     }
 }
 
-impl<'a> FromLua<'a> for LogEvent {
-    fn from_lua(value: LuaValue<'a>, _: &'a Lua) -> LuaResult<Self> {
-        match value {
-            LuaValue::Table(t) => {
-                let mut log = LogEvent::default();
-                for pair in t.pairs() {
-                    let (key, value): (String, Value) = pair?;
-                    log.insert_flat(key, value);
-                }
-                Ok(log)
-            }
-            _ => Err(mlua::Error::FromLuaConversionError {
-                from: value.type_name(),
-                to: "LogEvent",
-                message: Some("LogEvent should ba a Lua table".to_string()),
-            }),
-        }
+impl FromLua for LogEvent {
+    fn from_lua(lua_value: LuaValue, lua: &Lua) -> LuaResult<Self> {
+        let value = Value::from_lua(lua_value, lua)?;
+        Ok(LogEvent::from_parts(value, EventMetadata::default()))
     }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::event::Event;
 
     #[test]
-    fn to_lua() {
-        let mut event = Event::new_empty_log();
-        let log = event.as_mut_log();
+    fn into_lua() {
+        let mut log = LogEvent::default();
         log.insert("a", 1);
         log.insert("nested.field", "2");
         log.insert("nested.array[0]", "example value");
@@ -61,14 +46,14 @@ mod test {
             let result: bool = lua
                 .load(assertion)
                 .eval()
-                .unwrap_or_else(|_| panic!("Failed to verify assertion {:?}", assertion));
+                .unwrap_or_else(|_| panic!("Failed to verify assertion {assertion:?}"));
             assert!(result, "{}", assertion);
         }
     }
 
     #[test]
     fn from_lua() {
-        let lua_event = r#"
+        let lua_event = r"
         {
             a = 1,
             nested = {
@@ -76,7 +61,7 @@ mod test {
                 array = {'example value', '', 'another value'}
             }
         }
-        "#;
+        ";
 
         let event: LogEvent = Lua::new().load(lua_event).eval().unwrap();
 

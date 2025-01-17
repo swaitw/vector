@@ -1,7 +1,7 @@
 ---
 title: Unit testing Vector configurations
 short: Unit tests
-weight: 5
+weight: 6
 aliases: [
   "/docs/reference/tests",
   "/docs/reference/configuration/tests",
@@ -28,19 +28,13 @@ You can execute tests within a [configuration](#configuring) file using Vector's
 [`test`][vector_test] subcommand:
 
 ```bash
-vector test /etc/vector/vector.toml
+vector test /etc/vector/vector.yaml
 ```
 
 You can also specify multiple configuration files to test:
 
 ```bash
 vector test /etc/vector/pipeline1.toml /etc/vector/pipeline2.toml
-```
-
-Glob patterns are also supported:
-
-```bash
-vector test /etc/vector/*.toml
 ```
 
 Specifying multiple files is useful if you want to, for example, keep your unit tests in a separate
@@ -188,7 +182,7 @@ One important thing to note is that with this example configuration Vector is se
 logs from Docker images using the [`docker_logs`][docker_logs] source. If Vector were running in
 production, the `add_metadata` transform we're unit testing here would be modifying real log events.
 But that's *not* what we're testing here. Instead, the `insert_at = "add_metadata"` directive
-artifically inserts our test inputs into the `add_metadata` transform. You should think of Vector
+artificially inserts our test inputs into the `add_metadata` transform. You should think of Vector
 unit tests as a way of **mocking observability data sources** and ensuring that your transforms
 respond to those mock sources the way that you would expect.
 
@@ -223,14 +217,16 @@ Inside each test definition, you need to specify two things:
 
 ### Inputs
 
-In in the `inputs` array for the test, you have these options:
+In the `inputs` array for the test, you have these options:
 
 Parameter | Type | Description
 :---------|:-----|:-----------
+`type` | string | The type of input you're providing. [`vrl`](#logs), [`log`](#logs), [`raw`](#logs), or [`metric`](#metrics) are currently the only valid values.
 `insert_at` | string (name of transform) | The name of the transform into which the test input is inserted. This is particularly useful when you want to test only a subset of a transform pipeline.
 `value` | string (raw event value) | A raw string value to act as an input event. Use only in cases where events are raw strings and not structured objects with event fields.
 `log_fields` | object | If the transform handles [log events](#logs), these are the key/value pairs that comprise the input event.
 `metric` | object | If the transform handles [metric events](#metrics), these are the fields that comprise that metric. Subfields include `name`, `tags`, `kind`, and others.
+`source` | string (vrl program) | If the transform handles [log events](#logs), the result of the vrl program will be the input event.
 
 Here's an example `inputs` declaration:
 
@@ -250,7 +246,7 @@ message = "<102>1 2020-12-22T15:22:31.111Z vector-user.biz su 2666 ID389 - Somet
 
 ### Outputs
 
-In the `outputs` array of your unit testing configuration you specify two things:
+In the `outputs` array of your unit testing configuration, you specify two things:
 
 Parameter | Type | Description
 :---------|:-----|:-----------
@@ -261,7 +257,7 @@ Each condition in the `conditions` array has two fields:
 
 Parameter | Type | Description
 :---------|:-----|:-----------
-`type` | string | The type of condition you're providing. As the original `check_fields` syntax is now deprecated, [`vrl`][vrl] is currently the only valid value.
+`type` | string | The type of condition you're providing. [`vrl`][vrl] is currently the only valid value.
 `source` | string (VRL Boolean expression) | Explained in detail [above](#verifying).
 
 Here's an example `outputs` declaration:
@@ -278,11 +274,55 @@ assert!(exists(.tags))
 '''
 ```
 
-{{< danger title="`check_fields` conditions now deprecated" >}}
-Vector initially provided a `check_fields` condition type that enabled you to specify Boolean
-test conditions using a special configuration-based system. `check_fields` is now deprecated. We
-strongly recommend converting any existing `check_fields` tests to `vrl` conditions.
-{{< /danger >}}
+#### Asserting no output
+
+In some cases, you may need to assert that _no_ event is output by a transform. You can specify
+this at the root level of a specific test's configuration using the `no_outputs_from` parameter,
+which takes a list of transform names. Here's an example:
+
+```toml
+[[tests]]
+name = "Ensure no output"
+no_outputs_from = ["log_filter", "metric_filter"]
+```
+
+In this test configuration, Vector would expect that the `log_filter` and `metric_filter` transforms
+not to output _any_ events.
+
+Some examples of use cases for `no_outputs_from`:
+
+* When testing a [`filter`][filter] transform, you may want to assert that the [input](#inputs)
+  event is filtered out
+* When testing a [`remap`][remap] transform, you may need to assert that VRL's `abort` function is
+  called when the supplied [VRL] program handles the input event
+
+Below is a full example of using `no_outputs_from` in a Vector unit test:
+
+```toml
+[transforms.log_filter]
+type = "filter"
+inputs = ["log_source"]
+condition = '.env == "production"'
+
+[[tests]]
+name = "Filter out non-production events"
+no_outputs_from = ["log_filter"]
+
+[[tests.inputs]]
+type = "log"
+insert_at = "log_filter"
+
+[tests.inputs.log_fields]
+message = "success"
+code = 202
+endpoint = "/transactions"
+method = "POST"
+env = "staging"
+```
+
+This unit test passes because the `env` field of the input event has a value of `staging`, which
+fails the `.env == "production"` filtering condition; because the condition fails, no event is
+output by the `log_filter` transform in this case.
 
 ### Event types
 
@@ -293,8 +333,8 @@ There are currently two event types that you can unit test in Vector:
 
 #### Logs
 
-As explained in the section on [inputs](#inputs) above, when testing log events you have can specify
-either a structured event [object] or a raw [string].
+As explained in the section on [inputs](#inputs) above, when testing log events, you can specify
+either a structured event [object](#object) or a raw [string](#raw-string-value).
 
 ##### Object
 
@@ -307,6 +347,17 @@ code = 200
 id = "38c5b0d0-5e7e-42aa-ae86-2b642ad2d1b8"
 ```
 
+If there are hyphens in the field name, you will need to quote this part (at least in YAML):
+
+```yaml
+  - name: hyphens
+    inputs:
+      - insert_at: hyphens
+        type: log
+        log_fields:
+          labels."this-has-hyphens": "this is a test"
+```
+
 ##### Raw string value
 
 To specify a raw string value for a log event, use `value`:
@@ -315,6 +366,19 @@ To specify a raw string value for a log event, use `value`:
 [[tests.inputs]]
 insert_at = "add_metadata"
 value = "<102>1 2020-12-22T15:22:31.111Z vector-user.biz su 2666 ID389 - Something went wrong"
+```
+
+##### VRL program
+
+To specify a program to construct the log event, use `source`:
+
+```toml
+[[tests.inputs]]
+  insert_at = "canary"
+  type = "vrl"
+  source = """
+    . = {"a": {"b": "c"}, "d": now()}
+  """
 ```
 
 #### Metrics
@@ -332,6 +396,22 @@ kind = "absolute"
 counter = { value = 1 }
 ```
 
+Aggregated metrics are a little different:
+
+```yaml
+tests:
+  inputs:
+    insert_at: my_aggregate_metrics_transform
+    type: metric
+    metric:
+      name: http_rtt
+      kind: incremental
+      aggregated_histogram:
+        buckets: []
+        sum: 0
+        count: 0
+```
+
 Here's a full end-to-end example of unit testing a metric through a transform:
 
 ```toml
@@ -339,7 +419,7 @@ Here's a full end-to-end example of unit testing a metric through a transform:
 type = "remap"
 inputs = []
 source = '''
-env, err = get_env_var!("ENV")
+env, err = get_env_var("ENV")
 if err != null {
   log(err, level: "error")
 }
@@ -350,7 +430,7 @@ tags.environment = env
 name = "add_unique_id_test"
 
 [[tests.inputs]]
-insert_at = "add_unique_id_to_metric"
+insert_at = "add_env_to_metric"
 type = "metric"
 
 [tests.inputs.metric]
@@ -359,13 +439,13 @@ kind = "absolute"
 counter = { value = 1 }
 
 [[tests.outputs]]
-extract_from = "add_unique_id_to_metric"
+extract_from = "add_env_to_metric"
 
 [[tests.outputs.conditions]]
 type = "vrl"
 source = '''
 assert_eq!(.name, "website_hits")
-assert_eq!(.kind, "absolute)
+assert_eq!(.kind, "absolute")
 assert_eq!(.tags.environment, "production")
 '''
 ```
@@ -506,6 +586,7 @@ given that the `add_host_metadata` transform isn't included here:
 assert!(!exists(.tags.host), "host tag included")
 ```
 
+[abort]: /docs/reference/vrl/functions/#abort
 [assert]: /docs/reference/vrl/functions/#assert
 [assert_eq]: /docs/reference/vrl/functions/#assert_eq
 [assertions]: /docs/reference/vrl#assertions

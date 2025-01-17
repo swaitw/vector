@@ -1,26 +1,29 @@
-use super::semaphore::ShrinkableSemaphore;
-use super::{instant_now, AdaptiveConcurrencySettings};
+use std::{
+    future::Future,
+    sync::{Arc, Mutex, MutexGuard},
+    time::{Duration, Instant},
+};
+
+use tokio::sync::OwnedSemaphorePermit;
+use tower::timeout::error::Elapsed;
+use vector_lib::internal_event::{InternalEventHandle as _, Registered};
+
+use super::{instant_now, semaphore::ShrinkableSemaphore, AdaptiveConcurrencySettings};
 #[cfg(test)]
 use crate::test_util::stats::{TimeHistogram, TimeWeightedSum};
 use crate::{
-    emit,
     http::HttpError,
     internal_events::{
         AdaptiveConcurrencyAveragedRtt, AdaptiveConcurrencyInFlight, AdaptiveConcurrencyLimit,
-        AdaptiveConcurrencyObservedRtt,
+        AdaptiveConcurrencyLimitData, AdaptiveConcurrencyObservedRtt,
     },
     sinks::util::retries::{RetryAction, RetryLogic},
     stats::{EwmaVar, Mean, MeanVariance},
 };
-use std::future::Future;
-use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
-use tokio::sync::OwnedSemaphorePermit;
-use tower::timeout::error::Elapsed;
 
 /// Shared class for `tokio::sync::Semaphore` that manages adjusting the
 /// semaphore size and other associated data.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(super) struct Controller<L> {
     semaphore: Arc<ShrinkableSemaphore>,
     concurrency: Option<usize>,
@@ -29,6 +32,11 @@ pub(super) struct Controller<L> {
     pub(super) inner: Arc<Mutex<Inner>>,
     #[cfg(test)]
     pub(super) stats: Arc<Mutex<ControllerStatistics>>,
+
+    limit: Registered<AdaptiveConcurrencyLimit>,
+    in_flight: Registered<AdaptiveConcurrencyInFlight>,
+    observed_rtt: Registered<AdaptiveConcurrencyObservedRtt>,
+    averaged_rtt: Registered<AdaptiveConcurrencyAveragedRtt>,
 }
 
 #[derive(Debug)]
@@ -60,8 +68,8 @@ impl<L> Controller<L> {
         // If a `concurrency` is specified, it becomes both the
         // current limit and the maximum, effectively bypassing all the
         // mechanisms. Otherwise, the current limit is set to 1 and the
-        // maximum to MAX_CONCURRENCY.
-        let current_limit = concurrency.unwrap_or(1);
+        // maximum to `settings.max_concurrency_limit`.
+        let current_limit = concurrency.unwrap_or(settings.initial_concurrency);
         Self {
             semaphore: Arc::new(ShrinkableSemaphore::new(current_limit)),
             concurrency,
@@ -78,6 +86,22 @@ impl<L> Controller<L> {
             })),
             #[cfg(test)]
             stats: Arc::new(Mutex::new(ControllerStatistics::default())),
+            limit: register!(AdaptiveConcurrencyLimit),
+            in_flight: register!(AdaptiveConcurrencyInFlight),
+            observed_rtt: register!(AdaptiveConcurrencyObservedRtt),
+            averaged_rtt: register!(AdaptiveConcurrencyAveragedRtt),
+        }
+    }
+
+    /// An estimate of current load on service managed by this controller.
+    ///
+    /// 0.0 is no load, while 1.0 is max load.
+    pub(super) fn load(&self) -> f64 {
+        let inner = self.inner.lock().expect("Controller mutex is poisoned");
+        if inner.current_limit > 0 {
+            inner.in_flight as f64 / inner.current_limit as f64
+        } else {
+            1.0
         }
     }
 
@@ -99,9 +123,7 @@ impl<L> Controller<L> {
             inner.reached_limit = true;
         }
 
-        emit!(&AdaptiveConcurrencyInFlight {
-            in_flight: inner.in_flight as u64
-        });
+        self.in_flight.emit(inner.in_flight as u64);
     }
 
     /// Adjust the controller to a response, based on type of response
@@ -113,7 +135,7 @@ impl<L> Controller<L> {
 
         let rtt = now.saturating_duration_since(start);
         if use_rtt {
-            emit!(&AdaptiveConcurrencyObservedRtt { rtt });
+            self.observed_rtt.emit(rtt);
         }
         let rtt = rtt.as_secs_f64();
 
@@ -133,9 +155,7 @@ impl<L> Controller<L> {
         }
 
         inner.in_flight -= 1;
-        emit!(&AdaptiveConcurrencyInFlight {
-            in_flight: inner.in_flight as u64
-        });
+        self.in_flight.emit(inner.in_flight as u64);
 
         if use_rtt {
             inner.current_rtt.update(rtt);
@@ -172,9 +192,7 @@ impl<L> Controller<L> {
                     }
 
                     if let Some(current_rtt) = current_rtt {
-                        emit!(&AdaptiveConcurrencyAveragedRtt {
-                            rtt: Duration::from_secs_f64(current_rtt)
-                        });
+                        self.averaged_rtt.emit(Duration::from_secs_f64(current_rtt));
                     }
 
                     // Only manage the concurrency if `concurrency` was set to "adaptive"
@@ -208,7 +226,7 @@ impl<L> Controller<L> {
         // concurrency limit. Note that we only check this if we had
         // requests to go beyond the current limit to prevent
         // increasing the limit beyond what we have evidence for.
-        if inner.current_limit < super::MAX_CONCURRENCY
+        if inner.current_limit < self.settings.max_concurrency_limit
             && inner.reached_limit
             && !inner.had_back_pressure
             && current_rtt.is_some()
@@ -224,13 +242,16 @@ impl<L> Controller<L> {
         else if inner.current_limit > 1
             && (inner.had_back_pressure || current_rtt.unwrap_or(0.0) >= past_rtt.mean + threshold)
         {
-            // Decrease (multiplicative) the current concurrency limit
-            let to_forget = inner.current_limit
-                - (inner.current_limit as f64 * self.settings.decrease_ratio) as usize;
-            self.semaphore.forget_permits(to_forget);
-            inner.current_limit -= to_forget;
+            // Decrease (multiplicative) the current concurrency limit. The floor rounding in the
+            // `usize` conversion guarantees the new limit is smaller than the current limit, and
+            // the `.max` ensures the new limit is above zero.
+            let new_limit =
+                ((inner.current_limit as f64 * self.settings.decrease_ratio) as usize).max(1);
+            self.semaphore
+                .forget_permits(inner.current_limit - new_limit);
+            inner.current_limit = new_limit;
         }
-        emit!(&AdaptiveConcurrencyLimit {
+        self.limit.emit(AdaptiveConcurrencyLimitData {
             concurrency: inner.current_limit as u64,
             reached_limit: inner.reached_limit,
             had_back_pressure: inner.had_back_pressure,
@@ -270,7 +291,7 @@ where
                     warn!(
                         message = "Unhandled error response.",
                         %error,
-                        internal_log_rate_secs = 5
+                        internal_log_rate_limit = true
                     );
                     false
                 }

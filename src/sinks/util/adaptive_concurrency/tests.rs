@@ -1,24 +1,19 @@
-#![cfg(all(test, feature = "sources-generator"))]
+#![cfg(all(test, feature = "sources-demo_logs"))]
+#![allow(clippy::print_stderr)] //tests
 
-use super::controller::ControllerStatistics;
-use crate::{
-    config::{self, DataType, SinkConfig, SinkContext},
-    event::{metric::MetricValue, Event},
-    metrics::{self},
-    sinks::{
-        util::{
-            retries::RetryLogic, sink, BatchSettings, Concurrency, EncodedEvent, EncodedLength,
-            TowerRequestConfig, VecBuffer,
-        },
-        Healthcheck, VectorSink,
-    },
-    sources::generator::GeneratorConfig,
-    test_util::{
-        start_topology,
-        stats::{HistogramStats, LevelTimeHistogram, TimeHistogram, WeightedSumStats},
-    },
-};
 use core::task::Context;
+use std::{
+    collections::{HashMap, VecDeque},
+    fmt,
+    fs::File,
+    future::pending,
+    io::Read,
+    path::PathBuf,
+    pin::Pin,
+    sync::{Arc, Mutex},
+    task::Poll,
+};
+
 use futures::{
     channel::oneshot,
     future::{self, BoxFuture},
@@ -26,52 +21,66 @@ use futures::{
 };
 use rand::{thread_rng, Rng};
 use rand_distr::Exp1;
-use serde::{Deserialize, Serialize};
+use rstest::*;
+use serde::Deserialize;
 use snafu::Snafu;
-use std::pin::Pin;
-use std::{
-    collections::{HashMap, VecDeque},
-    fmt,
-    fs::{read_dir, File},
-    future::pending,
-    io::Read,
-    path::PathBuf,
-    sync::{Arc, Mutex},
-    task::Poll,
-};
 use tokio::time::{self, sleep, Duration, Instant};
 use tower::Service;
+use vector_lib::configurable::configurable_component;
+use vector_lib::json_size::JsonSize;
 
-#[derive(Copy, Clone, Debug, Derivative, Deserialize, Serialize)]
+use super::controller::ControllerStatistics;
+use super::AdaptiveConcurrencySettings;
+use crate::{
+    config::{self, AcknowledgementsConfig, Input, SinkConfig, SinkContext},
+    event::{metric::MetricValue, Event},
+    metrics,
+    sinks::{
+        util::{
+            retries::{JitterMode, RetryLogic},
+            BatchSettings, Concurrency, EncodedEvent, EncodedLength, TowerRequestConfig, VecBuffer,
+        },
+        Healthcheck, VectorSink,
+    },
+    sources::demo_logs::DemoLogsConfig,
+    test_util::{
+        self, start_topology,
+        stats::{HistogramStats, LevelTimeHistogram, TimeHistogram, WeightedSumStats},
+    },
+};
+
+/// Request handling action when the request limit has been exceeded.
+#[configurable_component]
+#[derive(Clone, Copy, Debug, Derivative)]
 #[derivative(Default)]
 #[serde(rename_all = "lowercase")]
 enum Action {
     #[derivative(Default)]
-    // Above the given limit, additional requests will return with an
-    // error.
+    /// Additional requests will return with an error.
     Defer,
-    // Above the given limit, additional requests will be silently
-    // dropped.
+
+    /// Additional requests will be silently dropped.
     Drop,
 }
 
-#[derive(Copy, Clone, Debug, Default, Deserialize, Serialize)]
+/// Limit parameters for sink's ARC behavior.
+#[configurable_component]
+#[derive(Clone, Copy, Debug, Default)]
 struct LimitParams {
-    // The scale is the amount a request's delay increases at higher
-    // levels of the variable.
+    /// The amount a request's delay increases at higher levels of the variable.
     #[serde(default)]
     scale: f64,
 
-    // The knee is the point above which a request's delay increases at
-    // an exponential scale rather than a linear scale.
+    /// The point above which a request's delay increases at an exponential scale rather than a linear scale.
     knee_start: Option<usize>,
 
+    /// The exponent value when the request's delay increase is in the exponential region.
     knee_exp: Option<f64>,
 
-    // The limit is the level above which more requests will be denied.
+    /// The level above which more requests will be denied.
     limit: Option<usize>,
 
-    // The action specifies how over-limit requests will be denied.
+    #[configurable(derived)]
     #[serde(default)]
     action: Action,
 }
@@ -79,7 +88,7 @@ struct LimitParams {
 impl LimitParams {
     fn action_at_level(&self, level: usize) -> Option<Action> {
         self.limit
-            .and_then(|limit| (level > limit).then(|| self.action))
+            .and_then(|limit| (level > limit).then_some(self.action))
     }
 
     fn scale(&self, level: usize) -> f64 {
@@ -88,7 +97,7 @@ impl LimitParams {
             self.knee_start
                 .map(|knee| {
                     self.knee_exp
-                        .unwrap_or_else(|| self.scale + 1.0)
+                        .unwrap_or(self.scale + 1.0)
                         .powf(level.saturating_sub(knee) as f64)
                         - 1.0
                 })
@@ -97,33 +106,42 @@ impl LimitParams {
     }
 }
 
-#[derive(Copy, Clone, Debug, Default, Deserialize, Serialize)]
+/// Test parameters for the sink's ARC behavior.
+#[configurable_component]
+#[derive(Clone, Copy, Debug, Default)]
 struct TestParams {
-    // The number of requests to issue.
+    /// The number of requests to issue.
     requests: usize,
 
-    // The time interval between requests.
+    /// The time interval between requests.
     #[serde(default = "default_interval")]
     interval: f64,
 
-    // The delay is the base time every request takes return.
+    /// The minimum duration that a request takes to return.
     delay: f64,
 
-    // The jitter is the amount of per-request response time randomness,
-    // as a fraction of `delay`. The average response time will be
-    // `delay * (1 + jitter)` and will have an exponential distribution
-    // with λ=1.
+    /// The amount of per-request response time randomness, as a fraction of `delay`.
+    ///
+    /// The average response time will be `delay * (1 + jitter)` and will have an exponential
+    /// distribution with λ=1.
     #[serde(default)]
     jitter: f64,
 
+    #[configurable(derived)]
     #[serde(default)]
     concurrency_limit_params: LimitParams,
 
+    #[configurable(derived)]
     #[serde(default)]
     rate: LimitParams,
 
+    #[configurable(derived)]
     #[serde(default = "default_concurrency")]
     concurrency: Concurrency,
+
+    #[configurable(derived)]
+    #[serde(default)]
+    adaptive_concurrency: AdaptiveConcurrencySettings,
 }
 
 const fn default_interval() -> f64 {
@@ -134,9 +152,14 @@ const fn default_concurrency() -> Concurrency {
     Concurrency::Adaptive
 }
 
-#[derive(Debug, Serialize)]
-struct TestConfig {
+/// Configuration for the `test_arc` sink.
+#[configurable_component(sink("test_arc", "Test (adaptive concurrency)."))]
+#[derive(Clone, Debug, Default)]
+pub struct TestConfig {
+    #[configurable(derived)]
     request: TowerRequestConfig,
+
+    #[configurable(derived)]
     params: TestParams,
 
     // The statistics collected by running a test must be local to that
@@ -144,27 +167,34 @@ struct TestConfig {
     // are created by `Default` and may be cloned to retain a handle.
     #[serde(skip)]
     control: Arc<Mutex<TestController>>,
+
     // Oh, the horror!
     #[serde(skip)]
     controller_stats: Arc<Mutex<Arc<Mutex<ControllerStatistics>>>>,
 }
 
+impl_generate_config_from_default!(TestConfig);
+
 #[async_trait::async_trait]
-#[typetag::serialize(name = "test")]
+#[typetag::serde(name = "test_arc")]
 impl SinkConfig for TestConfig {
-    async fn build(&self, cx: SinkContext) -> Result<(VectorSink, Healthcheck), crate::Error> {
-        let batch = BatchSettings::default().events(1).bytes(9999).timeout(9999);
-        let request = self.request.unwrap_with(&TowerRequestConfig::default());
+    async fn build(&self, _cx: SinkContext) -> Result<(VectorSink, Healthcheck), crate::Error> {
+        let mut batch_settings = BatchSettings::default();
+        batch_settings.size.bytes = 9999;
+        batch_settings.size.events = 1;
+        batch_settings.timeout = Duration::from_secs(9999);
+
+        let request = self.request.into_settings();
         let sink = request
             .batch_sink(
                 TestRetryLogic,
                 TestSink::new(self),
-                VecBuffer::new(batch.size),
-                batch.timeout,
-                cx.acker(),
-                sink::StdServiceLogic::default(),
+                VecBuffer::new(batch_settings.size),
+                batch_settings.timeout,
             )
-            .with_flat_map(|event| stream::iter(Some(Ok(EncodedEvent::new(event, 0)))))
+            .with_flat_map(|event| {
+                stream::iter(Some(Ok(EncodedEvent::new(event, 0, JsonSize::zero()))))
+            })
             .sink_map_err(|error| panic!("Fatal test sink error: {}", error));
         let healthcheck = future::ok(()).boxed();
 
@@ -177,19 +207,16 @@ impl SinkConfig for TestConfig {
         );
         *self.controller_stats.lock().unwrap() = stats;
 
-        Ok((VectorSink::Sink(Box::new(sink)), healthcheck))
+        #[allow(deprecated)]
+        Ok((VectorSink::from_event_sink(sink), healthcheck))
     }
 
-    fn input_type(&self) -> DataType {
-        DataType::Any
+    fn input(&self) -> Input {
+        Input::all()
     }
 
-    fn sink_type(&self) -> &'static str {
-        "test"
-    }
-
-    fn typetag_deserialize(&self) {
-        unimplemented!("not intended for use in real configs")
+    fn acknowledgements(&self) -> &AcknowledgementsConfig {
+        &AcknowledgementsConfig::DEFAULT
     }
 }
 
@@ -302,7 +329,7 @@ impl RetryLogic for TestRetryLogic {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct TestController {
     todo: usize,
     send_done: Option<oneshot::Sender<()>>,
@@ -372,7 +399,7 @@ impl Statistics {
     /// number of requests per second.
     fn prune_old_requests(&mut self, now: Instant) {
         let then = now - Duration::from_secs(1);
-        while let Some(&first) = self.requests.get(0) {
+        while let Some(&first) = self.requests.front() {
             if first > then {
                 break;
             }
@@ -388,14 +415,16 @@ struct TestResults {
 }
 
 async fn run_test(params: TestParams) -> TestResults {
-    let _ = metrics::init_test();
+    test_util::trace_init();
     let (send_done, is_done) = oneshot::channel();
 
     let test_config = TestConfig {
         request: TowerRequestConfig {
             concurrency: params.concurrency,
-            rate_limit_num: Some(9999),
-            timeout_secs: Some(1),
+            rate_limit_num: 9999,
+            timeout_secs: 1,
+            retry_jitter_mode: JitterMode::None,
+            adaptive_concurrency: params.adaptive_concurrency,
             ..Default::default()
         },
         params,
@@ -407,12 +436,16 @@ async fn run_test(params: TestParams) -> TestResults {
     let cstats = Arc::clone(&test_config.controller_stats);
 
     let mut config = config::Config::builder();
-    let generator =
-        GeneratorConfig::repeat(vec!["line 1".into()], params.requests, params.interval);
-    config.add_source("in", generator);
+    let demo_logs = DemoLogsConfig::repeat(
+        vec!["line 1".into()],
+        params.requests,
+        Duration::from_secs_f64(params.interval),
+        None,
+    );
+    config.add_source("in", demo_logs);
     config.add_sink("out", &["in"], test_config);
 
-    let (topology, _crash) = start_topology(config.build().unwrap(), false).await;
+    let (topology, _) = start_topology(config.build().unwrap(), false).await;
 
     let controller = metrics::Controller::get().unwrap();
 
@@ -436,6 +469,7 @@ async fn run_test(params: TestParams) -> TestResults {
 
     let metrics = controller
         .capture_metrics()
+        .into_iter()
         .map(|metric| (metric.name().to_string(), metric))
         .collect::<HashMap<_, _>>();
     // Ensure basic statistics are captured, don't actually examine them
@@ -590,9 +624,7 @@ struct TestInput {
     controller: ControllerResults,
 }
 
-async fn run_compare(file_path: PathBuf, input: TestInput) {
-    eprintln!("Running test in {:?}", file_path);
-
+async fn run_compare(input: TestInput) {
     let results = run_test(input.params).await;
 
     let mut failures = Vec::new();
@@ -640,42 +672,23 @@ async fn run_compare(file_path: PathBuf, input: TestInput) {
     assert!(failures.is_empty(), "{:#?}", results);
 }
 
+#[rstest]
 #[tokio::test]
-async fn all_tests() {
-    const PATH: &str = "tests/data/adaptive-concurrency";
-
-    // Read and parse everything first
-    let mut entries = read_dir(PATH)
-        .expect("Could not open data directory")
-        .map(|entry| entry.expect("Could not read data directory").path())
-        .filter_map(|file_path| {
-            if (file_path.extension().map(|ext| ext == "toml")).unwrap_or(false) {
-                let mut data = String::new();
-                File::open(&file_path)
-                    .unwrap()
-                    .read_to_string(&mut data)
-                    .unwrap();
-                let input: TestInput = toml::from_str(&data)
-                    .unwrap_or_else(|error| panic!("Invalid TOML in {:?}: {:?}", file_path, error));
-                Some((file_path, input))
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>();
-
-    entries.sort_unstable_by_key(|entry| entry.0.to_string_lossy().to_string());
+async fn all_tests(#[files("tests/data/adaptive-concurrency/*.toml")] file_path: PathBuf) {
+    let mut data = String::new();
+    File::open(&file_path)
+        .unwrap()
+        .read_to_string(&mut data)
+        .unwrap();
+    let input: TestInput = toml::from_str(&data)
+        .unwrap_or_else(|error| panic!("Invalid TOML in {:?}: {:?}", file_path, error));
 
     time::pause();
 
-    // The first delay takes just slightly longer than all the rest,
-    // which causes the first test to run differently than all the
-    // others. Throw in a dummy delay to take up this delay "slack".
+    // The first delay takes just slightly longer than all the rest, which causes the first
+    // statistic to be inaccurate. Throw in a dummy delay to take up this delay "slack".
     sleep(Duration::from_millis(1)).await;
     time::advance(Duration::from_millis(1)).await;
 
-    // Then run all the tests
-    for (file_path, input) in entries {
-        run_compare(file_path, input).await;
-    }
+    run_compare(input).await;
 }

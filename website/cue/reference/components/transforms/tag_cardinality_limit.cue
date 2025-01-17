@@ -7,6 +7,12 @@ components: transforms: tag_cardinality_limit: {
 		Limits the cardinality of tags on metric events, protecting against
 		accidental high cardinality usage that can commonly disrupt the stability
 		of metrics storages.
+
+		The default behavior is to drop the tag from incoming metrics when the configured
+		limit would be exceeded. Note that this is usually only useful when applied to
+		incremental counter metrics and can have unintended effects when applied to other
+		metric types. The default action to take can be modified with the
+		`limit_exceeded_action` option.
 		"""
 
 	classes: {
@@ -21,69 +27,15 @@ components: transforms: tag_cardinality_limit: {
 	}
 
 	support: {
-		targets: {
-			"aarch64-unknown-linux-gnu":      true
-			"aarch64-unknown-linux-musl":     true
-			"armv7-unknown-linux-gnueabihf":  true
-			"armv7-unknown-linux-musleabihf": true
-			"x86_64-apple-darwin":            true
-			"x86_64-pc-windows-msv":          true
-			"x86_64-unknown-linux-gnu":       true
-			"x86_64-unknown-linux-musl":      true
-		}
 		requirements: []
 		warnings: []
 		notices: []
 	}
 
-	configuration: {
-		cache_size_per_tag: {
-			common:        false
-			description:   "The size of the cache in bytes to use to detect duplicate tags. The bigger the cache the less likely it is to have a 'false positive' or a case where we allow a new value for tag even after we have reached the configured limits."
-			relevant_when: "mode = \"probabilistic\""
-			required:      false
-			warnings: []
-			type: uint: {
-				default: 5120000
-				unit:    "bytes"
-			}
-		}
-		limit_exceeded_action: {
-			common:      true
-			description: "Controls what should happen when a metric comes in with a tag that would exceed the configured limit on cardinality."
-			required:    false
-			warnings: []
-			type: string: {
-				default: "drop_tag"
-				enum: {
-					drop_tag:   "Remove tags that would exceed the configured limit from the incoming metric"
-					drop_event: "Drop any metric events that contain tags that would exceed the configured limit"
-				}
-				syntax: "literal"
-			}
-		}
-		mode: {
-			description: "Controls what approach is used internally to keep track of previously seen tags and determine when a tag on an incoming metric exceeds the limit."
-			required:    true
-			warnings: []
-			type: string: {
-				enum: {
-					exact:         "Has higher memory requirements than `probabilistic`, but never falsely outputs metrics with new tags after the limit has been hit."
-					probabilistic: "Has lower memory requirements than `exact`, but may occasionally allow metric events to pass through the transform even when they contain new tags that exceed the configured limit.  The rate at which this happens can be controlled by changing the value of `cache_size_per_tag`."
-				}
-				syntax: "literal"
-			}
-		}
-		value_limit: {
-			common:      true
-			description: "How many distinct values to accept for any given key."
-			required:    false
-			warnings: []
-			type: uint: {
-				default: 500
-				unit:    null
-			}
-		}
+	// TODO: It'd be nice to have a way to define the description of the enum tag field on the Rust
+	// side and propagate it forward, since this is a common pattern that gets used.
+	configuration: base.components.transforms.tag_cardinality_limit.configuration & {
+		mode: description: "Controls the approach taken for tracking tag cardinality."
 	}
 
 	input: {
@@ -96,22 +48,21 @@ components: transforms: tag_cardinality_limit: {
 			set:          true
 			summary:      true
 		}
+		traces: false
 	}
 
 	examples: [
 		{
 			title: "Drop high-cardinality tag"
-			context: """
+			notes: """
 				In this example we'll demonstrate how to drop a
 				high-cardinality tag named `user_id`. Notice that the
 				second metric's `user_id` tag has been removed. That's
 				because it exceeded the `value_limit`.
 				"""
 			configuration: {
-				fields: {
-					value_limit:           1
-					limit_exceeded_action: "drop_tag"
-				}
+				value_limit:           1
+				limit_exceeded_action: "drop_tag"
 			}
 			input: [
 				{metric: {
@@ -197,15 +148,15 @@ components: transforms: tag_cardinality_limit: {
 				```text
 				(number of distinct field names in the tags for your metrics * average length of
 				the field names for the tags) + (number of distinct field names in the tags of
-				-your metrics * `cache_size_per_tag`)
+				-your metrics * `cache_size_per_key`)
 				```
 
-				The `cache_size_per_tag` option controls the size of the bloom filter used
+				The `cache_size_per_key` option controls the size of the bloom filter used
 				for storing the set of acceptable values for any single key. The larger the
 				bloom filter the lower the false positive rate, which in our case means the less
 				likely we are to allow a new tag value that would otherwise violate a
 				configured limit. If you want to know the exact false positive rate for a given
-				`cache_size_per_tag` and `value_limit`, there are many free on-line bloom filter
+				`cache_size_per_key` and `value_limit`, there are many free on-line bloom filter
 				calculators that can answer this. The formula is generally presented in terms of
 				'n', 'p', 'k', and 'm' where 'n' is the number of items in the filter
 				(`value_limit` in our case), 'p' is the probability of false positives (what we

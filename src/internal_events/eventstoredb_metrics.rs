@@ -1,7 +1,6 @@
-// ## skip check-events ##
-
 use metrics::counter;
-use vector_core::internal_event::InternalEvent;
+use vector_lib::internal_event::InternalEvent;
+use vector_lib::internal_event::{error_stage, error_type};
 
 #[derive(Debug)]
 pub struct EventStoreDbMetricsHttpError {
@@ -9,12 +8,20 @@ pub struct EventStoreDbMetricsHttpError {
 }
 
 impl InternalEvent for EventStoreDbMetricsHttpError {
-    fn emit_logs(&self) {
-        error!(message = "HTTP request processing error.", error = ?self.error);
-    }
-
-    fn emit_metrics(&self) {
-        counter!("http_request_errors_total", 1);
+    fn emit(self) {
+        error!(
+            message = "HTTP request processing error.",
+            error = ?self.error,
+            stage = error_stage::RECEIVING,
+            error_type = error_type::REQUEST_FAILED,
+            internal_log_rate_limit = true,
+        );
+        counter!(
+            "component_errors_total",
+            "stage" => error_stage::RECEIVING,
+            "error_type" => error_type::REQUEST_FAILED,
+        )
+        .increment(1);
     }
 }
 
@@ -24,28 +31,19 @@ pub struct EventStoreDbStatsParsingError {
 }
 
 impl InternalEvent for EventStoreDbStatsParsingError {
-    fn emit_logs(&self) {
-        error!(message = "JSON parsing error.", error = ?self.error);
-    }
-
-    fn emit_metrics(&self) {
-        counter!("parse_errors_total", 1);
-    }
-}
-
-pub struct EventStoreDbMetricsReceived {
-    pub events: usize,
-    pub byte_size: usize,
-}
-
-impl InternalEvent for EventStoreDbMetricsReceived {
-    fn emit_logs(&self) {
-        debug!("Stats scraped.");
-    }
-
-    fn emit_metrics(&self) {
-        counter!("component_received_events_total", self.events as u64);
-        counter!("events_in_total", self.events as u64);
-        counter!("processed_bytes_total", self.byte_size as u64);
+    fn emit(self) {
+        error!(
+            message = "JSON parsing error.",
+            error = ?self.error,
+            stage = error_stage::PROCESSING,
+            error_type = error_type::PARSER_FAILED,
+            internal_log_rate_limit = true,
+        );
+        counter!(
+            "component_errors_total",
+            "stage" => error_stage::PROCESSING,
+            "error_type" => error_type::PARSER_FAILED,
+        )
+        .increment(1);
     }
 }

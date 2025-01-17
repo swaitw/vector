@@ -1,16 +1,18 @@
-use crate::shutdown::{ShutdownSignal, ShutdownSignalToken};
-use futures::{
-    channel::oneshot,
-    future::{select, BoxFuture, Either},
-    pin_mut, ready,
-    stream::FuturesUnordered,
-    FutureExt, StreamExt,
-};
 use std::{
     future::Future,
     pin::Pin,
-    task::{Context, Poll},
+    task::{ready, Context, Poll},
 };
+
+use futures::{
+    channel::oneshot,
+    future::{select, BoxFuture, Either},
+    pin_mut,
+    stream::FuturesOrdered,
+    FutureExt, StreamExt,
+};
+
+use crate::shutdown::ShutdownSignal;
 
 /// Lifecycle encapsulates logic for managing a lifecycle of multiple futures
 /// that are bounded together by a shared shutdown condition.
@@ -20,7 +22,7 @@ use std::{
 /// completing their work.
 #[derive(Debug)]
 pub struct Lifecycle<'bound> {
-    futs: FuturesUnordered<BoxFuture<'bound, ()>>,
+    futs: FuturesOrdered<BoxFuture<'bound, ()>>,
     fut_shutdowns: Vec<oneshot::Sender<()>>,
 }
 
@@ -29,19 +31,18 @@ pub struct Lifecycle<'bound> {
 /// after the shutdown is complete.
 #[derive(Debug)]
 pub enum GlobalShutdownToken {
-    /// The global shutdown signal was consumed, and we have a raw
-    /// [`ShutdownSignalToken`] now.
-    Token(ShutdownSignalToken),
+    /// The global shutdown signal was consumed.
+    Token,
     /// The [`ShutdownSignal`] wasn't consumed, and still holds on to the
-    /// [`ShutdownSignalToken`]. Keep it around.
-    Unused(ShutdownSignal),
+    /// [`ShutdownSignalToken`].
+    Unused,
 }
 
 impl<'bound> Lifecycle<'bound> {
     /// Create a new [`Lifecycle`].
     pub fn new() -> Self {
         Self {
-            futs: FuturesUnordered::new(),
+            futs: FuturesOrdered::new(),
             fut_shutdowns: Vec::new(),
         }
     }
@@ -69,15 +70,15 @@ impl<'bound> Lifecycle<'bound> {
         let token = match select(first_task_fut, &mut global_shutdown).await {
             Either::Left((None, _)) => {
                 trace!(message = "Lifecycle had no tasks upon run, we're done.");
-                GlobalShutdownToken::Unused(global_shutdown)
+                GlobalShutdownToken::Unused
             }
             Either::Left((Some(()), _)) => {
                 trace!(message = "Lifecycle had the first task completed.");
-                GlobalShutdownToken::Unused(global_shutdown)
+                GlobalShutdownToken::Unused
             }
-            Either::Right((shutdown_signal_token, _)) => {
+            Either::Right((_shutdown_signal_token, _)) => {
                 trace!(message = "Lifecycle got a global shutdown request.");
-                GlobalShutdownToken::Token(shutdown_signal_token)
+                GlobalShutdownToken::Token
             }
         };
 
@@ -110,13 +111,13 @@ pub struct Slot<'bound, 'lc> {
     shutdown_trigger: oneshot::Sender<()>,
 }
 
-impl<'bound, 'lc> Slot<'bound, 'lc> {
+impl<'bound> Slot<'bound, '_> {
     /// Bind the lifecycle slot to a concrete future.
     /// The passed future MUST start it's shutdown process when requested to
     /// shutdown via the signal passed from the corresponding
     /// [`ShutdownHandle`].
     pub fn bind(self, future: BoxFuture<'bound, ()>) {
-        self.lifecycle.futs.push(future);
+        self.lifecycle.futs.push_back(future);
         self.lifecycle.fut_shutdowns.push(self.shutdown_trigger);
     }
 }
@@ -129,7 +130,7 @@ impl Future for ShutdownHandle {
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let _ = ready!(self.0.poll_unpin(cx));
+        _ = ready!(self.0.poll_unpin(cx));
         Poll::Ready(())
     }
 }
