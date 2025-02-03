@@ -2,31 +2,36 @@
 
 #![deny(missing_docs)]
 
-use super::path_helpers::build_pod_logs_directory;
-use crate::kubernetes::{self as k8s, pod_manager_logic::extract_static_pod_config_hashsum};
-use evmap::ReadHandle;
-use file_source::paths_provider::PathsProvider;
-use k8s_openapi::api::core::v1::{Namespace, Pod};
 use std::path::PathBuf;
+
+use k8s_openapi::api::core::v1::{Namespace, Pod};
+use kube::runtime::reflector::{store::Store, ObjectRef};
+use vector_lib::file_source::paths_provider::PathsProvider;
+
+use super::path_helpers::build_pod_logs_directory;
+use crate::kubernetes::pod_manager_logic::extract_static_pod_config_hashsum;
 
 /// A paths provider implementation that uses the state obtained from the
 /// the k8s API.
 pub struct K8sPathsProvider {
-    pods_state_reader: ReadHandle<String, k8s::state::evmap::Value<Pod>>,
-    namespace_state_reader: ReadHandle<String, k8s::state::evmap::Value<Namespace>>,
+    pod_state: Store<Pod>,
+    namespace_state: Store<Namespace>,
+    include_paths: Vec<glob::Pattern>,
     exclude_paths: Vec<glob::Pattern>,
 }
 
 impl K8sPathsProvider {
     /// Create a new [`K8sPathsProvider`].
-    pub fn new(
-        pods_state_reader: ReadHandle<String, k8s::state::evmap::Value<Pod>>,
-        namespace_state_reader: ReadHandle<String, k8s::state::evmap::Value<Namespace>>,
+    pub const fn new(
+        pod_state: Store<Pod>,
+        namespace_state: Store<Namespace>,
+        include_paths: Vec<glob::Pattern>,
         exclude_paths: Vec<glob::Pattern>,
     ) -> Self {
         Self {
-            pods_state_reader,
-            namespace_state_reader,
+            pod_state,
+            namespace_state,
+            include_paths,
             exclude_paths,
         }
     }
@@ -36,42 +41,31 @@ impl PathsProvider for K8sPathsProvider {
     type IntoIter = Vec<PathBuf>;
 
     fn paths(&self) -> Vec<PathBuf> {
-        let read_ref = match self.pods_state_reader.read() {
-            Some(v) => v,
-            None => {
-                // The state is not initialized or gone, fallback to using an
-                // empty array.
-                // TODO: consider `panic`ing here instead - fail-fast approach
-                // is always better if possible, but it's not clear if it's
-                // a sane strategy here.
-                warn!(message = "Unable to read the state of the pods.");
-                return Vec::new();
-            }
-        };
+        let state = self.pod_state.state();
 
-        read_ref
+        state
             .into_iter()
             // filter out pods where we haven't fetched the namespace metadata yet
             // they will be picked up on a later run
-            .filter(|(uid, values)| {
-                let pod: &Pod = values
-                    .get_one()
-                    .expect("we are supposed to be working with single-item values only")
-                    .as_ref();
-                trace!(message = "Verifying Namespace metadata for pod.", uid = ?uid);
+            .filter(|pod| {
+                trace!(message = "Verifying Namespace metadata for pod.", pod = ?pod.metadata.name);
                 if let Some(namespace) = pod.metadata.namespace.as_ref() {
-                    self.namespace_state_reader.get(namespace).is_some()
+                    self.namespace_state
+                        .get(&ObjectRef::<Namespace>::new(namespace))
+                        .is_some()
                 } else {
                     false
                 }
             })
-            .flat_map(|(uid, values)| {
-                let pod = values
-                    .get_one()
-                    .expect("we are supposed to be working with single-item values only");
-                trace!(message = "Providing log paths for pod.", uid = ?uid);
-                let paths_iter = list_pod_log_paths(real_glob, pod);
-                exclude_paths(paths_iter, &self.exclude_paths)
+            .flat_map(|pod| {
+                trace!(message = "Providing log paths for pod.", pod = ?pod.metadata.name);
+                let paths_iter = list_pod_log_paths(real_glob, pod.as_ref());
+                filter_paths(
+                    filter_paths(paths_iter, &self.include_paths, true),
+                    &self.exclude_paths,
+                    false,
+                )
+                .collect::<Vec<_>>()
             })
             .collect()
     }
@@ -85,7 +79,7 @@ impl PathsProvider for K8sPathsProvider {
 /// `Static Pod`s: they keep their logs at the path that consists of config
 /// hashsum instead of the `Pod` `uid`. The reason for this is `kubelet` is
 /// locally authoritative over those `Pod`s, and the API only has
-/// `Monitor Pod`s - the "dummy" entires useful for discovery and association.
+/// `Monitor Pod`s - the "dummy" entries useful for discovery and association.
 /// Their UIDs are generated at the Kubernetes API side, and do not represent
 /// the actual config hashsum as one would expect.
 ///
@@ -93,9 +87,9 @@ impl PathsProvider for K8sPathsProvider {
 /// the effective config hashsum, see the `extract_static_pod_config_hashsum`
 /// function that does this.
 ///
-/// See https://github.com/timberio/vector/issues/6001
-/// See https://github.com/kubernetes/kubernetes/blob/ef3337a443b402756c9f0bfb1f844b1b45ce289d/pkg/kubelet/pod/pod_manager.go#L30-L44
-/// See https://github.com/kubernetes/kubernetes/blob/cea1d4e20b4a7886d8ff65f34c6d4f95efcb4742/pkg/kubelet/pod/mirror_client.go#L80-L81
+/// See <https://github.com/vectordotdev/vector/issues/6001>
+/// See <https://github.com/kubernetes/kubernetes/blob/ef3337a443b402756c9f0bfb1f844b1b45ce289d/pkg/kubelet/pod/pod_manager.go#L30-L44>
+/// See <https://github.com/kubernetes/kubernetes/blob/cea1d4e20b4a7886d8ff65f34c6d4f95efcb4742/pkg/kubelet/pod/mirror_client.go#L80-L81>
 fn extract_pod_logs_directory(pod: &Pod) -> Option<PathBuf> {
     let metadata = &pod.metadata;
     let namespace = metadata.namespace.as_ref()?;
@@ -173,7 +167,7 @@ where
                 build_container_exclusion_patterns(dir, excluded_containers).collect();
 
             // Return paths filtered with container exclusion.
-            exclude_paths(path_iter, exclusion_patterns)
+            filter_paths(path_iter, exclusion_patterns, false)
         })
 }
 
@@ -189,12 +183,13 @@ fn real_glob(pattern: &str) -> impl Iterator<Item = PathBuf> {
     .flat_map(|paths| paths.into_iter())
 }
 
-fn exclude_paths<'a>(
+fn filter_paths<'a>(
     iter: impl Iterator<Item = PathBuf> + 'a,
     patterns: impl AsRef<[glob::Pattern]> + 'a,
+    include: bool,
 ) -> impl Iterator<Item = PathBuf> + 'a {
     iter.filter(move |path| {
-        !patterns.as_ref().iter().any(|pattern| {
+        let m = patterns.as_ref().iter().any(|pattern| {
             pattern.matches_path_with(
                 path,
                 glob::MatchOptions {
@@ -202,18 +197,25 @@ fn exclude_paths<'a>(
                     ..Default::default()
                 },
             )
-        })
+        });
+        if include {
+            m
+        } else {
+            !m
+        }
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        build_container_exclusion_patterns, exclude_paths, extract_excluded_containers_for_pod,
-        extract_pod_logs_directory, list_pod_log_paths,
-    };
-    use k8s_openapi::{api::core::v1::Pod, apimachinery::pkg::apis::meta::v1::ObjectMeta};
     use std::path::PathBuf;
+
+    use k8s_openapi::{api::core::v1::Pod, apimachinery::pkg::apis::meta::v1::ObjectMeta};
+
+    use super::{
+        build_container_exclusion_patterns, extract_excluded_containers_for_pod,
+        extract_pod_logs_directory, filter_paths, list_pod_log_paths,
+    };
 
     #[test]
     fn test_extract_pod_logs_directory() {
@@ -520,7 +522,59 @@ mod tests {
                 .map(|pattern| glob::Pattern::new(pattern).unwrap())
                 .collect();
             let actual_paths: Vec<_> =
-                exclude_paths(input_paths.into_iter().map(Into::into), &patterns).collect();
+                filter_paths(input_paths.into_iter().map(Into::into), &patterns, false).collect();
+            let expected_paths: Vec<_> = expected_paths.into_iter().map(PathBuf::from).collect();
+            assert_eq!(
+                actual_paths, expected_paths,
+                "failed for patterns {:?}",
+                &str_patterns
+            )
+        }
+    }
+
+    #[test]
+    fn test_include_paths() {
+        let cases = vec![
+            (
+                vec![
+                    "/var/log/pods/a.log",
+                    "/var/log/pods/b.log",
+                    "/var/log/pods/c.log.foo",
+                    "/var/log/pods/d.logbar",
+                    "/tmp/foo",
+                ],
+                vec!["/var/log/pods/*"],
+                vec![
+                    "/var/log/pods/a.log",
+                    "/var/log/pods/b.log",
+                    "/var/log/pods/c.log.foo",
+                    "/var/log/pods/d.logbar",
+                ],
+            ),
+            (
+                vec![
+                    "/var/log/pods/a.log",
+                    "/var/log/pods/b.log",
+                    "/var/log/pods/c.log.foo",
+                    "/var/log/pods/d.logbar",
+                ],
+                vec!["/tmp/*"],
+                vec![],
+            ),
+            (
+                vec!["/var/log/pods/a.log", "/tmp/foo"],
+                vec!["**/*"],
+                vec!["/var/log/pods/a.log", "/tmp/foo"],
+            ),
+        ];
+
+        for (input_paths, str_patterns, expected_paths) in cases {
+            let patterns: Vec<_> = str_patterns
+                .iter()
+                .map(|pattern| glob::Pattern::new(pattern).unwrap())
+                .collect();
+            let actual_paths: Vec<_> =
+                filter_paths(input_paths.into_iter().map(Into::into), &patterns, true).collect();
             let expected_paths: Vec<_> = expected_paths.into_iter().map(PathBuf::from).collect();
             assert_eq!(
                 actual_paths, expected_paths,

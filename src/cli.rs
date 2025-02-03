@@ -1,34 +1,33 @@
-use crate::{config, generate, get_version, graph, list, unit_test, validate};
-use std::path::PathBuf;
-use structopt::{clap::AppSettings, StructOpt};
+#![allow(missing_docs)]
 
+use std::{num::NonZeroU64, path::PathBuf};
+
+use clap::{ArgAction, CommandFactory, FromArgMatches, Parser};
+
+#[cfg(windows)]
+use crate::service;
 #[cfg(feature = "api-client")]
 use crate::tap;
 #[cfg(feature = "api-client")]
 use crate::top;
+use crate::{config, convert_config, generate, get_version, graph, list, unit_test, validate};
+use crate::{generate_schema, signal};
 
-#[cfg(windows)]
-use crate::service;
-
-#[derive(StructOpt, Debug)]
-#[structopt(rename_all = "kebab-case")]
+#[derive(Parser, Debug)]
+#[command(rename_all = "kebab-case")]
 pub struct Opts {
-    #[structopt(flatten)]
+    #[command(flatten)]
     pub root: RootOpts,
 
-    #[structopt(subcommand)]
+    #[command(subcommand)]
     pub sub_command: Option<SubCommand>,
 }
 
 impl Opts {
-    pub fn get_matches() -> Self {
+    pub fn get_matches() -> Result<Self, clap::Error> {
         let version = get_version();
-        let app = Opts::clap().version(version.as_str()).global_settings(&[
-            AppSettings::ColoredHelp,
-            AppSettings::InferSubcommands,
-            AppSettings::DeriveDisplayOrder,
-        ]);
-        Opts::from_clap(&app.get_matches())
+        let app = Opts::command().version(version);
+        Opts::from_arg_matches(&app.get_matches())
     }
 
     pub const fn log_level(&self) -> &'static str {
@@ -36,7 +35,9 @@ impl Opts {
             Some(SubCommand::Validate(_))
             | Some(SubCommand::Graph(_))
             | Some(SubCommand::Generate(_))
-            | Some(SubCommand::List(_)) => {
+            | Some(SubCommand::ConvertConfig(_))
+            | Some(SubCommand::List(_))
+            | Some(SubCommand::Test(_)) => {
                 if self.root.verbose == 0 {
                     (self.root.quiet + 1, self.root.verbose)
                 } else {
@@ -58,19 +59,19 @@ impl Opts {
     }
 }
 
-#[derive(StructOpt, Debug)]
-#[structopt(rename_all = "kebab-case")]
+#[derive(Parser, Debug)]
+#[command(rename_all = "kebab-case")]
 pub struct RootOpts {
     /// Read configuration from one or more files. Wildcard paths are supported.
     /// File format is detected from the file name.
-    /// If zero files are specified the default config path
-    /// `/etc/vector/vector.toml` will be targeted.
-    #[structopt(
-        name = "config",
+    /// If zero files are specified, the deprecated default config path
+    /// `/etc/vector/vector.yaml` is targeted.
+    #[arg(
+        id = "config",
         short,
         long,
         env = "VECTOR_CONFIG",
-        use_delimiter(true)
+        value_delimiter(',')
     )]
     pub config_paths: Vec<PathBuf>,
 
@@ -78,63 +79,63 @@ pub struct RootOpts {
     /// File format is detected from the file name.
     ///
     /// Files not ending in .toml, .json, .yaml, or .yml will be ignored.
-    #[structopt(
-        name = "config-dir",
-        short = "C",
+    #[arg(
+        id = "config-dir",
+        short = 'C',
         long,
         env = "VECTOR_CONFIG_DIR",
-        use_delimiter(true)
+        value_delimiter(',')
     )]
     pub config_dirs: Vec<PathBuf>,
 
     /// Read configuration from one or more files. Wildcard paths are supported.
     /// TOML file format is expected.
-    #[structopt(
-        name = "config-toml",
+    #[arg(
+        id = "config-toml",
         long,
         env = "VECTOR_CONFIG_TOML",
-        use_delimiter(true)
+        value_delimiter(',')
     )]
     pub config_paths_toml: Vec<PathBuf>,
 
     /// Read configuration from one or more files. Wildcard paths are supported.
     /// JSON file format is expected.
-    #[structopt(
-        name = "config-json",
+    #[arg(
+        id = "config-json",
         long,
         env = "VECTOR_CONFIG_JSON",
-        use_delimiter(true)
+        value_delimiter(',')
     )]
     pub config_paths_json: Vec<PathBuf>,
 
     /// Read configuration from one or more files. Wildcard paths are supported.
     /// YAML file format is expected.
-    #[structopt(
-        name = "config-yaml",
+    #[arg(
+        id = "config-yaml",
         long,
         env = "VECTOR_CONFIG_YAML",
-        use_delimiter(true)
+        value_delimiter(',')
     )]
     pub config_paths_yaml: Vec<PathBuf>,
 
     /// Exit on startup if any sinks fail healthchecks
-    #[structopt(short, long, env = "VECTOR_REQUIRE_HEALTHY")]
+    #[arg(short, long, env = "VECTOR_REQUIRE_HEALTHY")]
     pub require_healthy: Option<bool>,
 
     /// Number of threads to use for processing (default is number of available cores)
-    #[structopt(short, long, env = "VECTOR_THREADS")]
+    #[arg(short, long, env = "VECTOR_THREADS")]
     pub threads: Option<usize>,
 
     /// Enable more detailed internal logging. Repeat to increase level. Overridden by `--quiet`.
-    #[structopt(short, long, parse(from_occurrences))]
+    #[arg(short, long, action = ArgAction::Count)]
     pub verbose: u8,
 
     /// Reduce detail of internal logging. Repeat to reduce further. Overrides `--verbose`.
-    #[structopt(short, long, parse(from_occurrences))]
+    #[arg(short, long, action = ArgAction::Count)]
     pub quiet: u8,
 
     /// Set the logging format
-    #[structopt(long, default_value = "text", env = "VECTOR_LOG_FORMAT", possible_values = &["text", "json"])]
+    #[arg(long, default_value = "text", env = "VECTOR_LOG_FORMAT")]
     pub log_format: LogFormat,
 
     /// Control when ANSI terminal formatting is used.
@@ -144,12 +145,97 @@ pub struct RootOpts {
     /// the `--color always` option will always enable ANSI terminal formatting. `--color never`
     /// will disable all ANSI terminal formatting. `--color auto` will attempt
     /// to detect it automatically.
-    #[structopt(long, default_value = "auto", env = "VECTOR_COLOR", possible_values = &["auto", "always", "never"])]
+    #[arg(long, default_value = "auto", env = "VECTOR_COLOR")]
     pub color: Color,
 
     /// Watch for changes in configuration file, and reload accordingly.
-    #[structopt(short, long, env = "VECTOR_WATCH_CONFIG")]
+    #[arg(short, long, env = "VECTOR_WATCH_CONFIG")]
     pub watch_config: bool,
+
+    /// Method for configuration watching.
+    ///
+    /// By default, `vector` uses recommended watcher for host OS
+    /// - `inotify` for Linux-based systems.
+    /// - `kqueue` for unix/macos
+    /// - `ReadDirectoryChangesWatcher` for windows
+    ///
+    /// The `poll` watcher can be used in cases where `inotify` doesn't work, e.g., when attaching the configuration via NFS.
+    #[arg(
+        long,
+        default_value = "recommended",
+        env = "VECTOR_WATCH_CONFIG_METHOD"
+    )]
+    pub watch_config_method: WatchConfigMethod,
+
+    /// Poll for changes in the configuration file at the given interval.
+    ///
+    /// This setting is only applicable if `Poll` is set in `--watch-config-method`.
+    #[arg(
+        long,
+        env = "VECTOR_WATCH_CONFIG_POLL_INTERVAL_SECONDS",
+        default_value = "30"
+    )]
+    pub watch_config_poll_interval_seconds: NonZeroU64,
+
+    /// Set the internal log rate limit
+    #[arg(
+        short,
+        long,
+        env = "VECTOR_INTERNAL_LOG_RATE_LIMIT",
+        default_value = "10"
+    )]
+    pub internal_log_rate_limit: u64,
+
+    /// Set the duration in seconds to wait for graceful shutdown after SIGINT or SIGTERM are
+    /// received. After the duration has passed, Vector will force shutdown. To never force
+    /// shutdown, use `--no-graceful-shutdown-limit`.
+    #[arg(
+        long,
+        default_value = "60",
+        env = "VECTOR_GRACEFUL_SHUTDOWN_LIMIT_SECS",
+        group = "graceful-shutdown-limit"
+    )]
+    pub graceful_shutdown_limit_secs: NonZeroU64,
+
+    /// Never time out while waiting for graceful shutdown after SIGINT or SIGTERM received.
+    /// This is useful when you would like for Vector to attempt to send data until terminated
+    /// by a SIGKILL. Overrides/cannot be set with `--graceful-shutdown-limit-secs`.
+    #[arg(
+        long,
+        default_value = "false",
+        env = "VECTOR_NO_GRACEFUL_SHUTDOWN_LIMIT",
+        group = "graceful-shutdown-limit"
+    )]
+    pub no_graceful_shutdown_limit: bool,
+
+    /// Set runtime allocation tracing
+    #[cfg(feature = "allocation-tracing")]
+    #[arg(long, env = "ALLOCATION_TRACING", default_value = "false")]
+    pub allocation_tracing: bool,
+
+    /// Set allocation tracing reporting rate in milliseconds.
+    #[cfg(feature = "allocation-tracing")]
+    #[arg(
+        long,
+        env = "ALLOCATION_TRACING_REPORTING_INTERVAL_MS",
+        default_value = "5000"
+    )]
+    pub allocation_tracing_reporting_interval_ms: u64,
+
+    /// Disable probing and configuration of root certificate locations on the system for OpenSSL.
+    ///
+    /// The probe functionality manipulates the `SSL_CERT_FILE` and `SSL_CERT_DIR` environment variables
+    /// in the Vector process. This behavior can be problematic for users of the `exec` source, which by
+    /// default inherits the environment of the Vector process.
+    #[arg(long, env = "VECTOR_OPENSSL_NO_PROBE", default_value = "false")]
+    pub openssl_no_probe: bool,
+
+    /// Allow the configuration to run without any components. This is useful for loading in an
+    /// empty stub config that will later be replaced with actual components. Note that this is
+    /// likely not useful without also watching for config file changes as described in
+    /// `--watch-config`.
+    #[arg(long, env = "VECTOR_ALLOW_EMPTY_CONFIG", default_value = "false")]
+    pub allow_empty_config: bool,
 }
 
 impl RootOpts {
@@ -169,16 +255,46 @@ impl RootOpts {
         )
         .collect()
     }
+
+    pub fn init_global(&self) {
+        if !self.openssl_no_probe {
+            openssl_probe::init_ssl_cert_env_vars();
+        }
+
+        crate::metrics::init_global().expect("metrics initialization failed");
+    }
 }
 
-#[derive(StructOpt, Debug)]
-#[structopt(rename_all = "kebab-case")]
+#[derive(Parser, Debug)]
+#[command(rename_all = "kebab-case")]
 pub enum SubCommand {
     /// Validate the target config, then exit.
     Validate(validate::Opts),
 
+    /// Convert a config file from one format to another.
+    /// This command can also walk directories recursively and convert all config files that are discovered.
+    /// Note that this is a best effort conversion due to the following reasons:
+    /// * The comments from the original config file are not preserved.
+    /// * Explicitly set default values in the original implementation might be omitted.
+    /// * Depending on how each source/sink config struct configures serde, there might be entries with null values.
+    ConvertConfig(convert_config::Opts),
+
     /// Generate a Vector configuration containing a list of components.
     Generate(generate::Opts),
+
+    /// Generate the configuration schema for this version of Vector. (experimental)
+    ///
+    /// A JSON Schema document will be generated that represents the valid schema for a
+    /// Vector configuration. This schema is based on the "full" configuration, such that for usages
+    /// where a configuration is split into multiple files, the schema would apply to those files
+    /// only when concatenated together.
+    ///
+    /// By default all output is writen to stdout. The `output_path` option can be used to redirect to a file.
+    GenerateSchema(generate_schema::Opts),
+
+    /// Output a provided Vector configuration file/dir as a single JSON object, useful for checking in to version control.
+    #[command(hide = true)]
+    Config(config::Opts),
 
     /// List available components, then exit.
     List(list::Opts),
@@ -194,7 +310,7 @@ pub enum SubCommand {
     #[cfg(feature = "api-client")]
     Top(top::Opts),
 
-    /// Observe log events from topology components
+    /// Observe output log events from source or transform components. Logs are sampled at a specified interval.
     #[cfg(feature = "api-client")]
     Tap(tap::Opts),
 
@@ -203,52 +319,75 @@ pub enum SubCommand {
     Service(service::Opts),
 
     /// Vector Remap Language CLI
-    #[cfg(feature = "vrl-cli")]
-    Vrl(vrl_cli::Opts),
+    Vrl(vrl::cli::Opts),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+impl SubCommand {
+    pub async fn execute(
+        &self,
+        mut signals: signal::SignalPair,
+        color: bool,
+    ) -> exitcode::ExitCode {
+        match self {
+            Self::Config(c) => config::cmd(c),
+            Self::ConvertConfig(opts) => convert_config::cmd(opts),
+            Self::Generate(g) => generate::cmd(g),
+            Self::GenerateSchema(opts) => generate_schema::cmd(opts),
+            Self::Graph(g) => graph::cmd(g),
+            Self::List(l) => list::cmd(l),
+            #[cfg(windows)]
+            Self::Service(s) => service::cmd(s),
+            #[cfg(feature = "api-client")]
+            Self::Tap(t) => tap::cmd(t, signals.receiver).await,
+            Self::Test(t) => unit_test::cmd(t, &mut signals.handler).await,
+            #[cfg(feature = "api-client")]
+            Self::Top(t) => top::cmd(t).await,
+            Self::Validate(v) => validate::validate(v, color).await,
+            Self::Vrl(s) => {
+                let mut functions = vrl::stdlib::all();
+                functions.extend(vector_vrl_functions::all());
+                vrl::cli::cmd::cmd(s, functions)
+            }
+        }
+    }
+}
+
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Color {
     Auto,
     Always,
     Never,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+impl Color {
+    pub fn use_color(&self) -> bool {
+        match self {
+            #[cfg(unix)]
+            Color::Auto => {
+                use std::io::IsTerminal;
+                std::io::stdout().is_terminal()
+            }
+            #[cfg(windows)]
+            Color::Auto => false, // ANSI colors are not supported by cmd.exe
+            Color::Always => true,
+            Color::Never => false,
+        }
+    }
+}
+
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogFormat {
     Text,
     Json,
 }
 
-impl std::str::FromStr for Color {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "auto" => Ok(Color::Auto),
-            "always" => Ok(Color::Always),
-            "never" => Ok(Color::Never),
-            s => Err(format!(
-                "{} is not a valid option, expected `auto`, `always` or `never`",
-                s
-            )),
-        }
-    }
-}
-
-impl std::str::FromStr for LogFormat {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "text" => Ok(LogFormat::Text),
-            "json" => Ok(LogFormat::Json),
-            s => Err(format!(
-                "{} is not a valid option, expected `text` or `json`",
-                s
-            )),
-        }
-    }
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchConfigMethod {
+    /// Recommended watcher for the current OS, usually `inotify` for Linux-based systems.
+    Recommended,
+    /// Poll-based watcher, typically used for watching files on EFS/NFS-like network storage systems.
+    /// The interval is determined by  [`RootOpts::watch_config_poll_interval_seconds`].
+    Poll,
 }
 
 pub fn handle_config_errors(errors: Vec<String>) -> exitcode::ExitCode {

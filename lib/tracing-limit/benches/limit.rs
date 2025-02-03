@@ -4,15 +4,15 @@ extern crate tracing;
 #[macro_use]
 extern crate criterion;
 
-use criterion::{black_box, BenchmarkId, Criterion};
 use std::{
     fmt,
     sync::{Mutex, MutexGuard},
 };
+
+use criterion::{black_box, BenchmarkId, Criterion};
 use tracing::{field, span, subscriber::Interest, Event, Metadata, Subscriber};
 use tracing_limit::RateLimitedLayer;
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::layer::{Context, Layer};
+use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
 
 const INPUTS: &[usize] = &[1, 100, 500, 1000];
 
@@ -59,7 +59,7 @@ fn bench(c: &mut Criterion) {
                             bar = "bar",
                             baz = 3,
                             quuux = ?0.99,
-                            internal_log_rate_secs = 5
+                            internal_log_rate_limit = true
                         )
                     }
                 })
@@ -94,10 +94,10 @@ where
 
 struct Visitor<'a>(MutexGuard<'a, String>);
 
-impl<'a> field::Visit for Visitor<'a> {
+impl field::Visit for Visitor<'_> {
     fn record_debug(&mut self, _field: &field::Field, value: &dyn fmt::Debug) {
         use std::fmt::Write;
-        let _ = write!(&mut *self.0, "{:?}", value);
+        _ = write!(&mut *self.0, "{:?}", value);
     }
 }
 
@@ -110,11 +110,11 @@ where
     }
 
     fn enabled(&self, metadata: &Metadata<'_>, _ctx: Context<'_, S>) -> bool {
-        let _ = metadata;
+        _ = metadata;
         true
     }
 
-    fn new_span(&self, span: &span::Attributes<'_>, _id: &span::Id, _ctx: Context<'_, S>) {
+    fn on_new_span(&self, span: &span::Attributes<'_>, _id: &span::Id, _ctx: Context<'_, S>) {
         let mut visitor = Visitor(self.mutex.lock().unwrap());
         span.record(&mut visitor);
     }
@@ -130,23 +130,23 @@ where
     }
 
     fn on_follows_from(&self, id: &span::Id, follows: &span::Id, _ctx: Context<'_, S>) {
-        let _ = (id, follows);
+        _ = (id, follows);
     }
 
     fn on_enter(&self, id: &span::Id, _ctx: Context<'_, S>) {
-        let _ = id;
+        _ = id;
     }
 
     fn on_exit(&self, id: &span::Id, _ctx: Context<'_, S>) {
-        let _ = id;
+        _ = id;
     }
 
     fn on_close(&self, id: span::Id, _ctx: Context<'_, S>) {
-        let _ = id;
+        _ = id;
     }
 
     fn on_id_change(&self, old: &span::Id, new: &span::Id, _ctx: Context<'_, S>) {
-        let _ = (old, new);
+        _ = (old, new);
     }
 }
 

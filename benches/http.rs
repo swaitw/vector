@@ -1,18 +1,20 @@
+use std::net::SocketAddr;
+
 use criterion::{criterion_group, BatchSize, BenchmarkId, Criterion, SamplingMode, Throughput};
 use futures::TryFutureExt;
 use hyper::{
     service::{make_service_fn, service_fn},
     Body, Response, Server,
 };
-use std::net::SocketAddr;
 use tokio::runtime::Runtime;
 use vector::{
     config, sinks,
-    sinks::util::Compression,
+    sinks::util::{BatchConfig, Compression},
     sources,
     test_util::{next_addr, random_lines, runtime, send_lines, start_topology, wait_for_tcp},
     Error,
 };
+use vector_lib::codecs::{encoding::FramingConfig, TextSerializerConfig};
 
 fn benchmark_http(c: &mut Criterion) {
     let num_lines: usize = 1_000;
@@ -39,22 +41,26 @@ fn benchmark_http(c: &mut Criterion) {
                             "in",
                             sources::socket::SocketConfig::make_basic_tcp_config(in_addr),
                         );
+                        let mut batch = BatchConfig::default();
+                        batch.max_bytes = Some(num_lines * line_size);
+
                         config.add_sink(
                             "out",
                             &["in"],
-                            sinks::http::HttpSinkConfig {
+                            sinks::http::config::HttpSinkConfig {
                                 uri: out_addr.to_string().parse::<http::Uri>().unwrap().into(),
                                 compression: *compression,
                                 method: Default::default(),
                                 auth: Default::default(),
                                 headers: Default::default(),
-                                batch: sinks::util::BatchConfig {
-                                    max_bytes: Some(num_lines * line_size),
-                                    ..Default::default()
-                                },
-                                encoding: sinks::http::Encoding::Text.into(),
+                                payload_prefix: Default::default(),
+                                payload_suffix: Default::default(),
+                                batch,
+                                encoding: (None::<FramingConfig>, TextSerializerConfig::default())
+                                    .into(),
                                 request: Default::default(),
                                 tls: Default::default(),
+                                acknowledgements: Default::default(),
                             },
                         );
 

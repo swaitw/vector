@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 /// Exponentially Weighted Moving Average
 #[derive(Clone, Copy, Debug)]
 pub struct Ewma {
@@ -23,6 +24,32 @@ impl Ewma {
         };
         self.average = Some(average);
         average
+    }
+}
+
+/// Exponentially Weighted Moving Average that starts with a default average value
+#[derive(Clone, Copy, Debug)]
+pub struct EwmaDefault {
+    average: f64,
+    alpha: f64,
+}
+
+impl EwmaDefault {
+    pub const fn new(alpha: f64, initial_value: f64) -> Self {
+        Self {
+            average: initial_value,
+            alpha,
+        }
+    }
+
+    pub const fn average(&self) -> f64 {
+        self.average
+    }
+
+    /// Update the current average and return it for convenience
+    pub fn update(&mut self, point: f64) -> f64 {
+        self.average = point.mul_add(self.alpha, self.average * (1.0 - self.alpha));
+        self.average
     }
 }
 

@@ -7,12 +7,13 @@ components: sources: mongodb_metrics: {
 		commonly_used: false
 		delivery:      "at_least_once"
 		deployment_roles: ["daemon", "sidecar"]
-		development:   "beta"
+		development:   "stable"
 		egress_method: "batch"
 		stateful:      false
 	}
 
 	features: {
+		acknowledgements: false
 		collect: {
 			checkpoint: enabled: false
 			from: {
@@ -35,16 +36,6 @@ components: sources: mongodb_metrics: {
 	}
 
 	support: {
-		targets: {
-			"aarch64-unknown-linux-gnu":      true
-			"aarch64-unknown-linux-musl":     true
-			"armv7-unknown-linux-gnueabihf":  true
-			"armv7-unknown-linux-musleabihf": true
-			"x86_64-apple-darwin":            true
-			"x86_64-pc-windows-msv":          true
-			"x86_64-unknown-linux-gnu":       true
-			"x86_64-unknown-linux-musl":      true
-		}
 		requirements: [
 			"""
 				User from endpoint should have enough privileges for running
@@ -60,36 +51,7 @@ components: sources: mongodb_metrics: {
 		platform_name: null
 	}
 
-	configuration: {
-		endpoints: {
-			description: "MongoDB [Connection String URI Format](\(urls.mongodb_connection_string_uri_format))"
-			required:    true
-			type: array: {
-				items: type: string: {
-					examples: ["mongodb://localhost:27017"]
-					syntax: "literal"
-				}
-			}
-		}
-		scrape_interval_secs: {
-			description: "The interval between scrapes."
-			common:      true
-			required:    false
-			type: uint: {
-				default: 15
-				unit:    "seconds"
-			}
-		}
-		namespace: {
-			description: "The namespace of metrics. Disabled if empty."
-			common:      false
-			required:    false
-			type: string: {
-				default: "mongodb"
-				syntax:  "literal"
-			}
-		}
-	}
+	configuration: base.components.sources.mongodb_metrics.configuration
 
 	how_it_works: {
 		mod_status: {
@@ -108,8 +70,6 @@ components: sources: mongodb_metrics: {
 	telemetry: metrics: {
 		collect_completed_total:  components.sources.internal_metrics.output.metrics.collect_completed_total
 		collect_duration_seconds: components.sources.internal_metrics.output.metrics.collect_duration_seconds
-		request_errors_total:     components.sources.internal_metrics.output.metrics.request_errors_total
-		parse_errors_total:       components.sources.internal_metrics.output.metrics.parse_errors_total
 	}
 
 	output: metrics: {
@@ -131,7 +91,7 @@ components: sources: mongodb_metrics: {
 			description:       "Number of assertions raised since the MongoDB process started."
 			type:              "counter"
 			default_namespace: "mongodb"
-			tags:              _mongodb_metrics_tags & {
+			tags: _mongodb_metrics_tags & {
 				type: {
 					description: "The assertion type"
 					required:    true
@@ -149,7 +109,7 @@ components: sources: mongodb_metrics: {
 			description:       "Number of connections in some state."
 			type:              "gauge"
 			default_namespace: "mongodb"
-			tags:              _mongodb_metrics_tags & {
+			tags: _mongodb_metrics_tags & {
 				state: {
 					description: "The connection state"
 					required:    true
@@ -192,7 +152,7 @@ components: sources: mongodb_metrics: {
 			description:       "Current memory unsage."
 			type:              "gauge"
 			default_namespace: "mongodb"
-			tags:              _mongodb_metrics_tags & {
+			tags: _mongodb_metrics_tags & {
 				type: {
 					description: "Memory type"
 					required:    true
@@ -204,7 +164,7 @@ components: sources: mongodb_metrics: {
 			description:       "Number of connected clients and the read and write operations performed by these clients."
 			type:              "gauge"
 			default_namespace: "mongodb"
-			tags:              _mongodb_metrics_tags & {
+			tags: _mongodb_metrics_tags & {
 				type: {
 					description: "Number type."
 					required:    true
@@ -216,7 +176,7 @@ components: sources: mongodb_metrics: {
 			description:       "Number of operations queued because of a lock."
 			type:              "gauge"
 			default_namespace: "mongodb"
-			tags:              _mongodb_metrics_tags & {
+			tags: _mongodb_metrics_tags & {
 				type: {
 					description: "Number type."
 					required:    true
@@ -234,7 +194,7 @@ components: sources: mongodb_metrics: {
 			description:       "Amount of time that any database has spent waiting for the global lock."
 			type:              "counter"
 			default_namespace: "mongodb"
-			tags:              _mongodb_metrics_tags & {
+			tags: _mongodb_metrics_tags & {
 				type: {
 					description: "Lock type."
 					required:    true
@@ -251,7 +211,7 @@ components: sources: mongodb_metrics: {
 			description:       "Number of cursors."
 			type:              "gauge"
 			default_namespace: "mongodb"
-			tags:              _mongodb_metrics_tags & {
+			tags: _mongodb_metrics_tags & {
 				state: {
 					description: "Cursor state."
 					required:    true
@@ -269,7 +229,7 @@ components: sources: mongodb_metrics: {
 			description:       "Document access and modification patterns."
 			type:              "counter"
 			default_namespace: "mongodb"
-			tags:              _mongodb_metrics_tags & {
+			tags: _mongodb_metrics_tags & {
 				state: {
 					description: "Document state."
 					required:    true
@@ -299,7 +259,7 @@ components: sources: mongodb_metrics: {
 			description:       "Update and query operations that MongoDB handles using special operation types."
 			type:              "counter"
 			default_namespace: "mongodb"
-			tags:              _mongodb_metrics_tags & {
+			tags: _mongodb_metrics_tags & {
 				type: {
 					description: "Operation type."
 					required:    true
@@ -311,7 +271,7 @@ components: sources: mongodb_metrics: {
 			description:       "Data from query execution system."
 			type:              "counter"
 			default_namespace: "mongodb"
-			tags:              _mongodb_metrics_tags & {
+			tags: _mongodb_metrics_tags & {
 				state: {
 					description: "Query state."
 					required:    true
@@ -365,7 +325,7 @@ components: sources: mongodb_metrics: {
 			description:       "Number of queued operations in the replication executor."
 			type:              "gauge"
 			default_namespace: "mongodb"
-			tags:              _mongodb_metrics_tags & {
+			tags: _mongodb_metrics_tags & {
 				type: {
 					description: "Queue type."
 					required:    true
@@ -425,7 +385,7 @@ components: sources: mongodb_metrics: {
 			description:       "Latency statistics."
 			type:              "gauge"
 			default_namespace: "mongodb"
-			tags:              _mongodb_metrics_tags & {
+			tags: _mongodb_metrics_tags & {
 				type: {
 					description: "Latency type."
 					required:    true
@@ -442,7 +402,7 @@ components: sources: mongodb_metrics: {
 			description:       "A 64-bit integer giving the total combined latency in microseconds."
 			type:              "gauge"
 			default_namespace: "mongodb"
-			tags:              _mongodb_metrics_tags & {
+			tags: _mongodb_metrics_tags & {
 				type: {
 					description: "Latency type."
 					required:    true
@@ -454,7 +414,7 @@ components: sources: mongodb_metrics: {
 			description:       "A 64-bit integer giving the total number of operations performed on the collection since startup."
 			type:              "gauge"
 			default_namespace: "mongodb"
-			tags:              _mongodb_metrics_tags & {
+			tags: _mongodb_metrics_tags & {
 				type: {
 					description: "Latency type."
 					required:    true
@@ -466,7 +426,7 @@ components: sources: mongodb_metrics: {
 			description:       "The name of the current storage engine."
 			type:              "gauge"
 			default_namespace: "mongodb"
-			tags:              _mongodb_metrics_tags & {
+			tags: _mongodb_metrics_tags & {
 				engine: {
 					description: "Engine name."
 					required:    true
@@ -479,7 +439,7 @@ components: sources: mongodb_metrics: {
 			relevant_when:     "Storage engine is `wiredTiger`."
 			type:              "counter"
 			default_namespace: "mongodb"
-			tags:              _mongodb_metrics_tags & {
+			tags: _mongodb_metrics_tags & {
 				type: {
 					description: "Operation type."
 					required:    true
@@ -492,7 +452,7 @@ components: sources: mongodb_metrics: {
 			relevant_when:     "Storage engine is `wiredTiger`."
 			type:              "counter"
 			default_namespace: "mongodb"
-			tags:              _mongodb_metrics_tags & {
+			tags: _mongodb_metrics_tags & {
 				type: {
 					description: "Operation type."
 					required:    true
@@ -505,7 +465,7 @@ components: sources: mongodb_metrics: {
 			relevant_when:     "Storage engine is `wiredTiger`."
 			type:              "gauge"
 			default_namespace: "mongodb"
-			tags:              _mongodb_metrics_tags & {
+			tags: _mongodb_metrics_tags & {
 				type: {
 					description: "Statistics type."
 					required:    true
@@ -518,7 +478,7 @@ components: sources: mongodb_metrics: {
 			relevant_when:     "Storage engine is `wiredTiger`."
 			type:              "counter"
 			default_namespace: "mongodb"
-			tags:              _mongodb_metrics_tags & {
+			tags: _mongodb_metrics_tags & {
 				type: {
 					description: "Statistics type."
 					required:    true
@@ -531,7 +491,7 @@ components: sources: mongodb_metrics: {
 			relevant_when:     "Storage engine is `wiredTiger`."
 			type:              "counter"
 			default_namespace: "mongodb"
-			tags:              _mongodb_metrics_tags & {
+			tags: _mongodb_metrics_tags & {
 				type: {
 					description: "Statistics type."
 					required:    true
@@ -556,7 +516,7 @@ components: sources: mongodb_metrics: {
 			relevant_when:     "Storage engine is `wiredTiger`."
 			type:              "gauge"
 			default_namespace: "mongodb"
-			tags:              _mongodb_metrics_tags & {
+			tags: _mongodb_metrics_tags & {
 				type: {
 					description: "Pages type."
 					required:    true
@@ -569,7 +529,7 @@ components: sources: mongodb_metrics: {
 			relevant_when:     "Storage engine is `wiredTiger`."
 			type:              "counter"
 			default_namespace: "mongodb"
-			tags:              _mongodb_metrics_tags & {
+			tags: _mongodb_metrics_tags & {
 				type: {
 					description: "Pages type."
 					required:    true
@@ -582,7 +542,7 @@ components: sources: mongodb_metrics: {
 			relevant_when:     "Storage engine is `wiredTiger`."
 			type:              "gauge"
 			default_namespace: "mongodb"
-			tags:              _mongodb_metrics_tags & {
+			tags: _mongodb_metrics_tags & {
 				type: {
 					description: "Transactions type."
 					required:    true
@@ -595,7 +555,7 @@ components: sources: mongodb_metrics: {
 			relevant_when:     "Storage engine is `wiredTiger`."
 			type:              "gauge"
 			default_namespace: "mongodb"
-			tags:              _mongodb_metrics_tags & {
+			tags: _mongodb_metrics_tags & {
 				type: {
 					description: "Transactions type."
 					required:    true
@@ -608,7 +568,7 @@ components: sources: mongodb_metrics: {
 			relevant_when:     "Storage engine is `wiredTiger`."
 			type:              "gauge"
 			default_namespace: "mongodb"
-			tags:              _mongodb_metrics_tags & {
+			tags: _mongodb_metrics_tags & {
 				type: {
 					description: "Transactions type."
 					required:    true
@@ -621,7 +581,7 @@ components: sources: mongodb_metrics: {
 			relevant_when:     "Storage engine is `wiredTiger`."
 			type:              "counter"
 			default_namespace: "mongodb"
-			tags:              _mongodb_metrics_tags & {
+			tags: _mongodb_metrics_tags & {
 				type: {
 					description: "Bytes type."
 					required:    true
@@ -634,7 +594,7 @@ components: sources: mongodb_metrics: {
 			relevant_when:     "Storage engine is `wiredTiger`."
 			type:              "counter"
 			default_namespace: "mongodb"
-			tags:              _mongodb_metrics_tags & {
+			tags: _mongodb_metrics_tags & {
 				type: {
 					description: "Operations type."
 					required:    true
@@ -647,7 +607,7 @@ components: sources: mongodb_metrics: {
 			relevant_when:     "Storage engine is `wiredTiger`."
 			type:              "counter"
 			default_namespace: "mongodb"
-			tags:              _mongodb_metrics_tags & {
+			tags: _mongodb_metrics_tags & {
 				type: {
 					description: "Scanned records type."
 					required:    true
@@ -674,7 +634,7 @@ components: sources: mongodb_metrics: {
 			relevant_when:     "Storage engine is `wiredTiger`."
 			type:              "gauge"
 			default_namespace: "mongodb"
-			tags:              _mongodb_metrics_tags & {
+			tags: _mongodb_metrics_tags & {
 				type: {
 					description: "Checkpoint type."
 					required:    true
@@ -701,7 +661,7 @@ components: sources: mongodb_metrics: {
 			relevant_when:     "Storage engine is `wiredTiger`."
 			type:              "counter"
 			default_namespace: "mongodb"
-			tags:              _mongodb_metrics_tags & {
+			tags: _mongodb_metrics_tags & {
 				type: {
 					description: "Transactions type."
 					required:    true
@@ -713,7 +673,7 @@ components: sources: mongodb_metrics: {
 			description:       "The number of bytes that reflects the amount of network traffic."
 			type:              "counter"
 			default_namespace: "mongodb"
-			tags:              _mongodb_metrics_tags & {
+			tags: _mongodb_metrics_tags & {
 				state: {
 					description: "Bytes state."
 					required:    true
@@ -731,7 +691,7 @@ components: sources: mongodb_metrics: {
 			description:       "Database replication operations by type since the mongod instance last started."
 			type:              "counter"
 			default_namespace: "mongodb"
-			tags:              _mongodb_metrics_tags & {
+			tags: _mongodb_metrics_tags & {
 				type: {
 					description: "Counter type."
 					required:    true
@@ -743,7 +703,7 @@ components: sources: mongodb_metrics: {
 			description:       "Database operations by type since the mongod instance last started."
 			type:              "counter"
 			default_namespace: "mongodb"
-			tags:              _mongodb_metrics_tags & {
+			tags: _mongodb_metrics_tags & {
 				type: {
 					description: "Counter type."
 					required:    true
@@ -760,11 +720,7 @@ components: sources: mongodb_metrics: {
 	}
 
 	telemetry: metrics: {
-		events_in_total:                 components.sources.internal_metrics.output.metrics.events_in_total
-		collect_completed_total:         components.sources.internal_metrics.output.metrics.collect_completed_total
-		collect_duration_seconds:        components.sources.internal_metrics.output.metrics.collect_duration_seconds
-		parse_errors_total:              components.sources.internal_metrics.output.metrics.parse_errors_total
-		request_errors_total:            components.sources.internal_metrics.output.metrics.request_errors_total
-		component_received_events_total: components.sources.internal_metrics.output.metrics.component_received_events_total
+		collect_completed_total:  components.sources.internal_metrics.output.metrics.collect_completed_total
+		collect_duration_seconds: components.sources.internal_metrics.output.metrics.collect_duration_seconds
 	}
 }

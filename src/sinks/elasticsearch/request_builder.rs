@@ -1,30 +1,39 @@
-use crate::sinks::util::{Compression, RequestBuilder};
+use bytes::Bytes;
+use vector_lib::EstimatedJsonEncodedSizeOf;
+use vector_lib::{json_size::JsonSize, request_metadata::RequestMetadata};
 
-use crate::sinks::elasticsearch::encoder::{ElasticSearchEncoder, ProcessedEvent};
+use crate::{
+    event::{EventFinalizers, Finalizable},
+    sinks::{
+        elasticsearch::{
+            encoder::{ElasticsearchEncoder, ProcessedEvent},
+            service::ElasticsearchRequest,
+        },
+        util::{
+            metadata::RequestMetadataBuilder, request_builder::EncodeResult, Compression,
+            RequestBuilder,
+        },
+    },
+};
 
-use crate::sinks::elasticsearch::service::ElasticSearchRequest;
-
-use crate::event::{EventFinalizers, Finalizable};
-use crate::sinks::util::encoding::EncodingConfigFixed;
-use vector_core::ByteSizeOf;
-
+#[derive(Debug, Clone)]
 pub struct ElasticsearchRequestBuilder {
     pub compression: Compression,
-    pub encoder: EncodingConfigFixed<ElasticSearchEncoder>,
+    pub encoder: ElasticsearchEncoder,
 }
 
 pub struct Metadata {
     finalizers: EventFinalizers,
     batch_size: usize,
-    events_byte_size: usize,
+    events_byte_size: JsonSize,
 }
 
 impl RequestBuilder<Vec<ProcessedEvent>> for ElasticsearchRequestBuilder {
     type Metadata = Metadata;
     type Events = Vec<ProcessedEvent>;
-    type Encoder = EncodingConfigFixed<ElasticSearchEncoder>;
-    type Payload = Vec<u8>;
-    type Request = ElasticSearchRequest;
+    type Encoder = ElasticsearchEncoder;
+    type Payload = Bytes;
+    type Request = ElasticsearchRequest;
     type Error = std::io::Error;
 
     fn compression(&self) -> Compression {
@@ -35,27 +44,38 @@ impl RequestBuilder<Vec<ProcessedEvent>> for ElasticsearchRequestBuilder {
         &self.encoder
     }
 
-    fn split_input(&self, mut events: Vec<ProcessedEvent>) -> (Self::Metadata, Self::Events) {
+    fn split_input(
+        &self,
+        mut events: Vec<ProcessedEvent>,
+    ) -> (Self::Metadata, RequestMetadataBuilder, Self::Events) {
         let events_byte_size = events
             .iter()
-            .map(|x| x.log.size_of())
+            .map(|x| x.log.estimated_json_encoded_size_of())
             .reduce(|a, b| a + b)
-            .unwrap_or(0);
+            .unwrap_or(JsonSize::zero());
 
-        let metadata = Metadata {
+        let metadata_builder = RequestMetadataBuilder::from_events(&events);
+
+        let es_metadata = Metadata {
             finalizers: events.take_finalizers(),
             batch_size: events.len(),
             events_byte_size,
         };
-        (metadata, events)
+        (es_metadata, metadata_builder, events)
     }
 
-    fn build_request(&self, metadata: Self::Metadata, payload: Vec<u8>) -> Self::Request {
-        ElasticSearchRequest {
-            payload,
-            finalizers: metadata.finalizers,
-            batch_size: metadata.batch_size,
-            events_byte_size: metadata.events_byte_size,
+    fn build_request(
+        &self,
+        es_metadata: Self::Metadata,
+        metadata: RequestMetadata,
+        payload: EncodeResult<Self::Payload>,
+    ) -> Self::Request {
+        ElasticsearchRequest {
+            payload: payload.into_payload(),
+            finalizers: es_metadata.finalizers,
+            batch_size: es_metadata.batch_size,
+            events_byte_size: es_metadata.events_byte_size,
+            metadata,
         }
     }
 }

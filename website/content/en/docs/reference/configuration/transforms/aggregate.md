@@ -1,6 +1,7 @@
 ---
 title: Aggregate
-kind: transform
+description: Aggregate metrics passing through a topology
+component_kind: transform
 layout: component
 tags: ["aggregate", "component", "transform"]
 ---

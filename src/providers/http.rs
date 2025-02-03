@@ -1,25 +1,26 @@
-use super::Result;
-use crate::{
-    config::{
-        self,
-        provider::{ProviderConfig, ProviderDescription},
-        ProxyConfig,
-    },
-    http::HttpClient,
-    signal,
-    tls::{TlsOptions, TlsSettings},
-};
 use async_stream::stream;
 use bytes::Buf;
 use futures::Stream;
 use hyper::Body;
 use indexmap::IndexMap;
-use serde::{Deserialize, Serialize};
 use tokio::time;
 use url::Url;
+use vector_lib::configurable::configurable_component;
 
-#[derive(Deserialize, Serialize, Debug, Clone)]
+use crate::{
+    config::{self, provider::ProviderConfig, ProxyConfig},
+    http::HttpClient,
+    signal,
+    tls::{TlsConfig, TlsSettings},
+};
+
+use super::BuildResult;
+
+/// Request settings.
+#[configurable_component]
+#[derive(Clone, Debug)]
 pub struct RequestConfig {
+    /// HTTP headers to add to the request.
     #[serde(default)]
     pub headers: IndexMap<String, String>,
 }
@@ -32,18 +33,25 @@ impl Default for RequestConfig {
     }
 }
 
-#[derive(Deserialize, Serialize, Debug, Clone)]
+/// Configuration for the `http` provider.
+#[configurable_component(provider("http"))]
+#[derive(Clone, Debug)]
 #[serde(deny_unknown_fields, default)]
 pub struct HttpConfig {
+    /// URL for the HTTP provider.
     url: Option<Url>,
+
+    #[configurable(derived)]
     request: RequestConfig,
+
+    /// How often to poll the provider, in seconds.
     poll_interval_secs: u64,
+
     #[serde(flatten)]
-    tls_options: Option<TlsOptions>,
-    #[serde(
-        default,
-        skip_serializing_if = "crate::serde::skip_serializing_if_default"
-    )]
+    tls_options: Option<TlsConfig>,
+
+    #[configurable(derived)]
+    #[serde(default, skip_serializing_if = "crate::serde::is_default")]
     proxy: ProxyConfig,
 }
 
@@ -62,10 +70,10 @@ impl Default for HttpConfig {
 /// Makes an HTTP request to the provided endpoint, returning the String body.
 async fn http_request(
     url: &Url,
-    tls_options: &Option<TlsOptions>,
+    tls_options: Option<&TlsConfig>,
     headers: &IndexMap<String, String>,
     proxy: &ProxyConfig,
-) -> std::result::Result<bytes::Bytes, &'static str> {
+) -> Result<bytes::Bytes, &'static str> {
     let tls_settings = TlsSettings::from_options(tls_options).map_err(|_| "Invalid TLS options")?;
     let http_client =
         HttpClient::<Body>::new(tls_settings, proxy).map_err(|_| "Invalid TLS settings")?;
@@ -115,28 +123,22 @@ async fn http_request(
 /// Calls `http_request`, serializing the result to a `ConfigBuilder`.
 async fn http_request_to_config_builder(
     url: &Url,
-    tls_options: &Option<TlsOptions>,
+    tls_options: Option<&TlsConfig>,
     headers: &IndexMap<String, String>,
     proxy: &ProxyConfig,
-) -> Result {
+) -> BuildResult {
     let config_str = http_request(url, tls_options, headers, proxy)
         .await
         .map_err(|e| vec![e.to_owned()])?;
 
-    let (config_builder, warnings) = config::load(config_str.chunk(), None)?;
-
-    for warning in warnings.into_iter() {
-        warn!("{}", warning);
-    }
-
-    Ok(config_builder)
+    config::load(config_str.chunk(), crate::config::format::Format::Toml)
 }
 
 /// Polls the HTTP endpoint after/every `poll_interval_secs`, returning a stream of `ConfigBuilder`.
 fn poll_http(
     poll_interval_secs: u64,
     url: Url,
-    tls_options: Option<TlsOptions>,
+    tls_options: Option<TlsConfig>,
     headers: IndexMap<String, String>,
     proxy: ProxyConfig,
 ) -> impl Stream<Item = signal::SignalTo> {
@@ -147,9 +149,9 @@ fn poll_http(
         loop {
             interval.tick().await;
 
-            match http_request_to_config_builder(&url, &tls_options, &headers, &proxy).await {
+            match http_request_to_config_builder(&url, tls_options.as_ref(), &headers, &proxy).await {
                 Ok(config_builder) => yield signal::SignalTo::ReloadFromConfigBuilder(config_builder),
-                Err(_) => return,
+                Err(_) => {},
             };
 
             info!(
@@ -160,10 +162,8 @@ fn poll_http(
     }
 }
 
-#[async_trait::async_trait]
-#[typetag::serde(name = "http")]
 impl ProviderConfig for HttpConfig {
-    async fn build(&mut self, signal_handler: &mut signal::SignalHandler) -> Result {
+    async fn build(&mut self, signal_handler: &mut signal::SignalHandler) -> BuildResult {
         let url = self
             .url
             .take()
@@ -175,7 +175,8 @@ impl ProviderConfig for HttpConfig {
 
         let proxy = ProxyConfig::from_env().merge(&self.proxy);
         let config_builder =
-            http_request_to_config_builder(&url, &tls_options, &request.headers, &proxy).await?;
+            http_request_to_config_builder(&url, tls_options.as_ref(), &request.headers, &proxy)
+                .await?;
 
         // Poll for changes to remote configuration.
         signal_handler.add(poll_http(
@@ -188,14 +189,6 @@ impl ProviderConfig for HttpConfig {
 
         Ok(config_builder)
     }
-
-    fn provider_type(&self) -> &'static str {
-        "http"
-    }
-}
-
-inventory::submit! {
-    ProviderDescription::new::<HttpConfig>("http")
 }
 
 impl_generate_config_from_default!(HttpConfig);

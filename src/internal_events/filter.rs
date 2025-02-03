@@ -1,11 +1,14 @@
-use metrics::counter;
-use vector_core::internal_event::InternalEvent;
+use vector_lib::internal_event::{ComponentEventsDropped, Count, Registered, INTENTIONAL};
 
-#[derive(Debug)]
-pub struct FilterEventDiscarded;
-
-impl InternalEvent for FilterEventDiscarded {
-    fn emit_metrics(&self) {
-        counter!("events_discarded_total", 1);
+vector_lib::registered_event! (
+    FilterEventsDropped => {
+        events_dropped: Registered<ComponentEventsDropped<'static, INTENTIONAL>>
+            = register!(ComponentEventsDropped::<INTENTIONAL>::from(
+                "Events matched filter condition."
+            )),
     }
-}
+
+    fn emit(&self, data: Count) {
+        self.events_dropped.emit(data);
+    }
+);

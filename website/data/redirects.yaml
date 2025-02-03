@@ -9,8 +9,10 @@ sinks:
 - aws_kinesis_firehose
 - aws_kinesis_streams
 - aws_s3
+- axiom
 - azure_monitor_logs
 - clickhouse
+- databend
 - datadog_logs
 - datadog_metrics
 - elasticsearch
@@ -26,10 +28,12 @@ sinks:
 - influxdb_logs
 - influxdb_metrics
 - kafka
-- logdna
+- keep
+- mezmo
 - loki
 - nats
 - new_relic_logs
+- new_relic
 - papertrail
 - prometheus_exporter
 - prometheus_remote_write
@@ -58,6 +62,7 @@ sources:
 - postgresql_metrics
 - prometheus_remote_write
 - prometheus_scrape
+- pulsar
 - socket
 - splunk_hec
 - statsd

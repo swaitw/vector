@@ -1,9 +1,9 @@
 ---
 title: StatsD
-description: Collect logs emitted by the [StatsD](https://github.com/statsd/statsd) aggregator
-kind: source
+description: Collect metrics emitted via [StatsD](https://github.com/statsd/statsd) protocol
+component_kind: source
 layout: component
-tags: ["statsd", "component", "source", "logs"]
+tags: ["statsd", "component", "source", "metrics"]
 ---
 
 {{/*

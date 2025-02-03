@@ -1,7 +1,7 @@
-//! The Datadog Logs [`VectorSink`]
+//! The Datadog Logs [`vector_lib::sink::VectorSink`]
 //!
-//! This module contains the [`VectorSink`] instance that is responsible for
-//! taking a stream of [`Event`] instances and getting them flung out to the
+//! This module contains the [`vector_lib::sink::VectorSink`] instance that is responsible for
+//! taking a stream of [`vector_lib::event::Event`] instances and getting them flung out to the
 //! Datadog Log API. The log API is relatively generous in terms of its
 //! constraints, except that:
 //!
@@ -19,17 +19,13 @@
 //! `/v1/input` to `/api/v2/logs`, but the content of the above documentation
 //! still applies for `/api/v2/logs`.
 
+#[cfg(all(test, feature = "datadog-logs-integration-tests"))]
+mod integration_tests;
 #[cfg(test)]
 mod tests;
 
-mod config;
-mod healthcheck;
-mod service;
-mod sink;
+pub mod config;
+pub mod service;
+pub mod sink;
 
-use crate::config::SinkDescription;
-use crate::sinks::datadog::logs::config::DatadogLogsConfig;
-
-inventory::submit! {
-    SinkDescription::new::<DatadogLogsConfig>("datadog_logs")
-}
+pub use self::config::DatadogLogsConfig;

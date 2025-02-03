@@ -1,7 +1,12 @@
-use crate::event::{Metric, MetricKind, MetricValue};
-use serde::de::{MapAccess, Visitor};
-use serde::{Deserialize, Deserializer};
-use std::collections::BTreeMap;
+use std::sync::LazyLock;
+
+use regex::Regex;
+use serde::{
+    de::{self, Error, MapAccess, Unexpected, Visitor},
+    Deserialize, Deserializer,
+};
+
+use crate::event::{Metric, MetricKind, MetricTags, MetricValue};
 
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -13,11 +18,11 @@ pub struct Stats {
 impl Stats {
     pub fn metrics(&self, namespace: Option<String>) -> Vec<Metric> {
         let mut result = Vec::new();
-        let mut tags = BTreeMap::new();
+        let mut tags = MetricTags::default();
         let now = chrono::Utc::now();
         let namespace = namespace.unwrap_or_else(|| "eventstoredb".to_string());
 
-        tags.insert("id".to_string(), self.proc.id.to_string());
+        tags.replace("id".to_string(), self.proc.id.to_string());
 
         result.push(
             Metric::new(
@@ -98,7 +103,7 @@ impl Stats {
         );
 
         if let Some(drive) = self.sys.drive.as_ref() {
-            tags.insert("path".to_string(), drive.path.clone());
+            tags.replace("path".to_string(), drive.path.clone());
 
             result.push(
                 Metric::new(
@@ -203,7 +208,10 @@ impl<'de> Deserialize<'de> for Drive {
 pub struct DriveStats {
     pub available_bytes: usize,
     pub total_bytes: usize,
-    pub usage: String,
+    // EventstoreDB v24.2 has the value as an string representing the percent like 30%
+    // v24.6 has it as integer value like 30. Here we handle both.
+    #[serde(deserialize_with = "percent_or_integer")]
+    pub usage: usize,
     pub used_bytes: usize,
 }
 
@@ -229,4 +237,53 @@ impl<'de> Visitor<'de> for DriveVisitor {
 
         Err(serde::de::Error::missing_field("<Drive path>"))
     }
+}
+
+// Can be either an integer or a string like 30%
+fn percent_or_integer<'de, D>(deserializer: D) -> Result<usize, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct PercentOrInteger;
+    static PERCENT_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(\d+)%").unwrap());
+
+    impl Visitor<'_> for PercentOrInteger {
+        type Value = usize;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("string or map")
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            if let Some(caps) = PERCENT_REGEX.captures(value) {
+                caps[1].parse::<usize>().map_err(|err| {
+                    Error::custom(format!("could not parse percent value into usize: {}", err))
+                })
+            } else {
+                Err(de::Error::invalid_value(
+                    Unexpected::Str(value),
+                    &"string did not contain a percent value like 30%",
+                ))
+            }
+        }
+
+        fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            usize::try_from(v).map_err(Error::custom)
+        }
+
+        fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            usize::try_from(v).map_err(Error::custom)
+        }
+    }
+
+    deserializer.deserialize_any(PercentOrInteger)
 }

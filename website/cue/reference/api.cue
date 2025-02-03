@@ -5,7 +5,6 @@ package metadata
 
 api: {
 	description:     !=""
-	playground_url:  !=""
 	schema_json_url: !=""
 	configuration:   #Schema
 	endpoints:       #Endpoints
@@ -17,7 +16,6 @@ api: {
 		running Vector instance, enabling introspection and management of
 		Vector in real-time.
 		"""
-	playground_url:  "https://playground.vector.dev:8686/playground"
 	schema_json_url: "https://github.com/vectordotdev/vector/blob/master/lib/vector-api-client/graphql/schema.json"
 	configuration: {
 		enabled: {
@@ -31,8 +29,7 @@ api: {
 			required: false
 			type: string: {
 				default: "127.0.0.1:8686"
-				examples: ["0.0.0.0:8686", "localhost:1234"]
-				syntax: "literal"
+				examples: ["0.0.0.0:8686", "127.0.0.1:1234"]
 			}
 			description: """
 				The network address to which the API should bind. If you're running
@@ -47,7 +44,18 @@ api: {
 			description: """
 				Whether the [GraphQL Playground](\(urls.graphql_playground)) is enabled
 				for the API. The Playground is accessible via the `/playground` endpoint
-				of the address set using the `bind` parameter.
+				of the address set using the `bind` parameter. Note that the `playground`
+				endpoint will only be enabled if the `graphql` endpoint is also enabled.
+				"""
+		}
+		graphql: {
+			common:   true
+			required: false
+			type: bool: default: true
+			description: """
+				Whether the endpoint for receiving and processing GraphQL queries is
+				enabled for the API. The endpoint is accessible via the `/graphql`
+				endpoint of the address set using the `bind` parameter.
 				"""
 		}
 	}
@@ -91,10 +99,6 @@ api: {
 					A bundled GraphQL playground that enables you
 					to explore the available queries and manually
 					run queries.
-
-					We offer a [public playground](\(playground_url))
-					that you can explore without hosting your own
-					Vector instance.
 					"""
 				responses: {
 					"200": {

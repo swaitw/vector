@@ -1,3 +1,4 @@
+#![deny(warnings)]
 #![warn(
     missing_debug_implementations,
     rust_2018_idioms,
@@ -8,3 +9,4 @@
 
 pub mod dns_message;
 pub mod dns_message_parser;
+pub mod ede;

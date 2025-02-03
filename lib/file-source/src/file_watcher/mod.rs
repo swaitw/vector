@@ -1,18 +1,32 @@
-use crate::buffer::read_until_with_max_size;
-use crate::metadata_ext::PortableFileExt;
-use crate::{FilePosition, ReadFrom};
-use bytes::{Bytes, BytesMut};
-use chrono::{DateTime, Utc};
-use flate2::bufread::MultiGzDecoder;
 use std::{
     fs::{self, File},
     io::{self, BufRead, Seek},
     path::PathBuf,
     time::{Duration, Instant},
 };
+
+use bytes::{Bytes, BytesMut};
+use chrono::{DateTime, Utc};
+use flate2::bufread::MultiGzDecoder;
 use tracing::debug;
+use vector_common::constants::GZIP_MAGIC;
+
+use crate::{
+    buffer::read_until_with_max_size, metadata_ext::PortableFileExt, FilePosition, ReadFrom,
+};
 #[cfg(test)]
 mod tests;
+
+/// The `RawLine` struct is a thin wrapper around the bytes that have been read
+/// in order to retain the context of where in the file they have been read from.
+///
+/// The offset field contains the byte offset of the beginning of the line within
+/// the file that it was read from.
+#[derive(Debug)]
+pub(super) struct RawLine {
+    pub offset: u64,
+    pub bytes: Bytes,
+}
 
 /// The `FileWatcher` struct defines the polling based state machine which reads
 /// from a file path, transparently updating the underlying file descriptor when
@@ -29,8 +43,10 @@ pub struct FileWatcher {
     devno: u64,
     inode: u64,
     is_dead: bool,
+    reached_eof: bool,
     last_read_attempt: Instant,
     last_read_success: Instant,
+    last_seen: Instant,
     max_line_bytes: usize,
     line_delimiter: Bytes,
     buf: BytesMut,
@@ -130,8 +146,10 @@ impl FileWatcher {
             devno,
             inode: ino,
             is_dead: false,
+            reached_eof: false,
             last_read_attempt: ts,
             last_read_success: ts,
+            last_seen: ts,
             max_line_bytes,
             line_delimiter,
             buf: BytesMut::new(),
@@ -163,6 +181,9 @@ impl FileWatcher {
 
     pub fn set_file_findable(&mut self, f: bool) {
         self.findable = f;
+        if f {
+            self.last_seen = Instant::now();
+        }
     }
 
     pub fn file_findable(&self) -> bool {
@@ -186,11 +207,12 @@ impl FileWatcher {
     /// This function will attempt to read a new line from its file, blocking,
     /// up to some maximum but unspecified amount of time. `read_line` will open
     /// a new file handler as needed, transparently to the caller.
-    pub fn read_line(&mut self) -> io::Result<Option<Bytes>> {
+    pub(super) fn read_line(&mut self) -> io::Result<Option<RawLine>> {
         self.track_read_attempt();
 
         let reader = &mut self.reader;
         let file_position = &mut self.file_position;
+        let initial_position = *file_position;
         match read_until_with_max_size(
             reader,
             file_position,
@@ -200,7 +222,10 @@ impl FileWatcher {
         ) {
             Ok(Some(_)) => {
                 self.track_read_success();
-                Ok(Some(self.buf.split().freeze()))
+                Ok(Some(RawLine {
+                    offset: initial_position,
+                    bytes: self.buf.split().freeze(),
+                }))
             }
             Ok(None) => {
                 if !self.file_findable() {
@@ -211,11 +236,16 @@ impl FileWatcher {
                     let buf = self.buf.split().freeze();
                     if buf.is_empty() {
                         // EOF
+                        self.reached_eof = true;
                         Ok(None)
                     } else {
-                        Ok(Some(buf))
+                        Ok(Some(RawLine {
+                            offset: initial_position,
+                            bytes: buf,
+                        }))
                     }
                 } else {
+                    self.reached_eof = true;
                     Ok(None)
                 }
             }
@@ -248,13 +278,23 @@ impl FileWatcher {
         self.last_read_success.elapsed() < Duration::from_secs(10)
             || self.last_read_attempt.elapsed() > Duration::from_secs(10)
     }
+
+    #[inline]
+    pub fn last_seen(&self) -> Instant {
+        self.last_seen
+    }
+
+    #[inline]
+    pub fn reached_eof(&self) -> bool {
+        self.reached_eof
+    }
 }
 
 fn is_gzipped(r: &mut io::BufReader<fs::File>) -> io::Result<bool> {
     let header_bytes = r.fill_buf()?;
     // WARN: The paired `BufReader::consume` is not called intentionally. If we
     // do we'll chop a decent part of the potential gzip stream off.
-    Ok(header_bytes.starts_with(&[0x1f, 0x8b]))
+    Ok(header_bytes.starts_with(GZIP_MAGIC))
 }
 
 fn null_reader() -> impl BufRead {

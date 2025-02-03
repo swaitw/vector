@@ -1,15 +1,19 @@
 pub mod logs;
 pub mod metrics;
 
-use crate::http::HttpClient;
+use std::collections::HashMap;
+
+use bytes::{BufMut, BytesMut};
 use chrono::{DateTime, Utc};
 use futures::FutureExt;
 use http::{StatusCode, Uri};
-use serde::{Deserialize, Serialize};
-use snafu::ResultExt;
-use snafu::Snafu;
-use std::collections::{BTreeMap, HashMap};
+use snafu::{ResultExt, Snafu};
 use tower::Service;
+use vector_lib::configurable::configurable_component;
+use vector_lib::event::{KeyString, MetricTags};
+use vector_lib::sensitive_string::SensitiveString;
+
+use crate::http::HttpClient;
 
 pub(in crate::sinks) enum Field {
     /// string
@@ -17,7 +21,9 @@ pub(in crate::sinks) enum Field {
     /// float
     Float(f64),
     /// unsigned integer
-    UnsignedInt(u32),
+    /// Influx can support 64 bit integers if compiled with a flag, see:
+    /// <https://github.com/influxdata/influxdb/issues/7801#issuecomment-466801839>
+    UnsignedInt(u64),
     /// integer
     Int(i64),
     /// boolean
@@ -45,26 +51,80 @@ enum ConfigError {
     },
 }
 
-#[derive(Deserialize, Serialize, Debug, Clone)]
+/// Configuration settings for InfluxDB v0.x/v1.x.
+#[configurable_component]
+#[derive(Clone, Debug)]
 pub struct InfluxDb1Settings {
+    /// The name of the database to write into.
+    ///
+    /// Only relevant when using InfluxDB v0.x/v1.x.
+    #[configurable(metadata(docs::examples = "vector-database"))]
+    #[configurable(metadata(docs::examples = "iot-store"))]
     database: String,
+
+    /// The consistency level to use for writes.
+    ///
+    /// Only relevant when using InfluxDB v0.x/v1.x.
+    #[configurable(metadata(docs::examples = "any"))]
+    #[configurable(metadata(docs::examples = "one"))]
+    #[configurable(metadata(docs::examples = "quorum"))]
+    #[configurable(metadata(docs::examples = "all"))]
     consistency: Option<String>,
+
+    /// The target retention policy for writes.
+    ///
+    /// Only relevant when using InfluxDB v0.x/v1.x.
+    #[configurable(metadata(docs::examples = "autogen"))]
+    #[configurable(metadata(docs::examples = "one_day_only"))]
     retention_policy_name: Option<String>,
+
+    /// The username to authenticate with.
+    ///
+    /// Only relevant when using InfluxDB v0.x/v1.x.
+    #[configurable(metadata(docs::examples = "todd"))]
+    #[configurable(metadata(docs::examples = "vector-source"))]
     username: Option<String>,
-    password: Option<String>,
+
+    /// The password to authenticate with.
+    ///
+    /// Only relevant when using InfluxDB v0.x/v1.x.
+    #[configurable(metadata(docs::examples = "${INFLUXDB_PASSWORD}"))]
+    #[configurable(metadata(docs::examples = "influxdb4ever"))]
+    password: Option<SensitiveString>,
 }
 
-#[derive(Deserialize, Serialize, Debug, Clone)]
+/// Configuration settings for InfluxDB v2.x.
+#[configurable_component]
+#[derive(Clone, Debug)]
 pub struct InfluxDb2Settings {
+    /// The name of the organization to write into.
+    ///
+    /// Only relevant when using InfluxDB v2.x and above.
+    #[configurable(metadata(docs::examples = "my-org"))]
+    #[configurable(metadata(docs::examples = "33f2cff0a28e5b63"))]
     org: String,
+
+    /// The name of the bucket to write into.
+    ///
+    /// Only relevant when using InfluxDB v2.x and above.
+    #[configurable(metadata(docs::examples = "vector-bucket"))]
+    #[configurable(metadata(docs::examples = "4d2225e4d3d49f75"))]
     bucket: String,
-    token: String,
+
+    /// The [token][token_docs] to authenticate with.
+    ///
+    /// Only relevant when using InfluxDB v2.x and above.
+    ///
+    /// [token_docs]: https://v2.docs.influxdata.com/v2.0/security/tokens/
+    #[configurable(metadata(docs::examples = "${INFLUXDB_TOKEN}"))]
+    #[configurable(metadata(docs::examples = "ef8d5de700e7989468166c40fc8a0ccd"))]
+    token: SensitiveString,
 }
 
 trait InfluxDbSettings: std::fmt::Debug {
     fn write_uri(&self, endpoint: String) -> crate::Result<Uri>;
     fn healthcheck_uri(&self, endpoint: String) -> crate::Result<Uri>;
-    fn token(&self) -> String;
+    fn token(&self) -> SensitiveString;
     fn protocol_version(&self) -> ProtocolVersion;
 }
 
@@ -77,7 +137,7 @@ impl InfluxDbSettings for InfluxDb1Settings {
                 ("consistency", self.consistency.clone()),
                 ("db", Some(self.database.clone())),
                 ("rp", self.retention_policy_name.clone()),
-                ("p", self.password.clone()),
+                ("p", self.password.as_ref().map(|v| v.inner().to_owned())),
                 ("u", self.username.clone()),
                 ("precision", Some("ns".to_owned())),
             ],
@@ -88,8 +148,8 @@ impl InfluxDbSettings for InfluxDb1Settings {
         encode_uri(&endpoint, "ping", &[])
     }
 
-    fn token(&self) -> String {
-        "".to_string()
+    fn token(&self) -> SensitiveString {
+        SensitiveString::default()
     }
 
     fn protocol_version(&self) -> ProtocolVersion {
@@ -114,7 +174,7 @@ impl InfluxDbSettings for InfluxDb2Settings {
         encode_uri(&endpoint, "ping", &[])
     }
 
-    fn token(&self) -> String {
+    fn token(&self) -> SensitiveString {
         self.token.clone()
     }
 
@@ -167,113 +227,122 @@ fn healthcheck(
     .boxed())
 }
 
-// https://v2.docs.influxdata.com/v2.0/reference/syntax/line-protocol/
+// https://docs.influxdata.com/influxdb/latest/reference/syntax/line-protocol/
 pub(in crate::sinks) fn influx_line_protocol(
     protocol_version: ProtocolVersion,
-    measurement: String,
-    metric_type: &str,
-    tags: Option<BTreeMap<String, String>>,
-    fields: Option<HashMap<String, Field>>,
+    measurement: &str,
+    tags: Option<MetricTags>,
+    fields: Option<HashMap<KeyString, Field>>,
     timestamp: i64,
-    line_protocol: &mut String,
+    line_protocol: &mut BytesMut,
 ) -> Result<(), &'static str> {
     // Fields
-    let unwrapped_fields = fields.unwrap_or_else(HashMap::new);
+    let unwrapped_fields = fields.unwrap_or_default();
     // LineProtocol should have a field
     if unwrapped_fields.is_empty() {
         return Err("fields must not be empty");
     }
 
     encode_string(measurement, line_protocol);
-    line_protocol.push(',');
 
-    // Tags
-    let mut unwrapped_tags = tags.unwrap_or_else(BTreeMap::new);
-    unwrapped_tags.insert("metric_type".to_owned(), metric_type.to_owned());
-    encode_tags(unwrapped_tags, line_protocol);
-    line_protocol.push(' ');
+    // Tags are optional
+    let unwrapped_tags = tags.unwrap_or_default();
+    if !unwrapped_tags.is_empty() {
+        line_protocol.put_u8(b',');
+        encode_tags(unwrapped_tags, line_protocol);
+    }
+    line_protocol.put_u8(b' ');
 
     // Fields
     encode_fields(protocol_version, unwrapped_fields, line_protocol);
-    line_protocol.push(' ');
+    line_protocol.put_u8(b' ');
 
     // Timestamp
-    line_protocol.push_str(&timestamp.to_string());
-    line_protocol.push('\n');
+    line_protocol.put_slice(&timestamp.to_string().into_bytes());
+    line_protocol.put_u8(b'\n');
     Ok(())
 }
 
-fn encode_tags(tags: BTreeMap<String, String>, output: &mut String) {
+fn encode_tags(tags: MetricTags, output: &mut BytesMut) {
+    let original_len = output.len();
     // `tags` is already sorted
-    for (key, value) in tags {
+    for (key, value) in tags.iter_single() {
         if key.is_empty() || value.is_empty() {
             continue;
         }
-        encode_string(key.to_string(), output);
-        output.push('=');
-        encode_string(value.to_string(), output);
-        output.push(',');
+        encode_string(key, output);
+        output.put_u8(b'=');
+        encode_string(value, output);
+        output.put_u8(b',');
     }
 
     // remove last ','
-    output.pop();
+    if output.len() > original_len {
+        output.truncate(output.len() - 1);
+    }
 }
 
 fn encode_fields(
     protocol_version: ProtocolVersion,
-    fields: HashMap<String, Field>,
-    output: &mut String,
+    fields: HashMap<KeyString, Field>,
+    output: &mut BytesMut,
 ) {
+    let original_len = output.len();
     for (key, value) in fields.into_iter() {
-        encode_string(key.to_string(), output);
-        output.push('=');
+        encode_string(&key, output);
+        output.put_u8(b'=');
         match value {
             Field::String(s) => {
-                output.push('"');
+                output.put_u8(b'"');
                 for c in s.chars() {
                     if "\\\"".contains(c) {
-                        output.push('\\');
+                        output.put_u8(b'\\');
                     }
-                    output.push(c);
+                    let mut c_buffer: [u8; 4] = [0; 4];
+                    output.put_slice(c.encode_utf8(&mut c_buffer).as_bytes());
                 }
-                output.push('"');
+                output.put_u8(b'"');
             }
-            Field::Float(f) => output.push_str(&f.to_string()),
+            Field::Float(f) => output.put_slice(&f.to_string().into_bytes()),
             Field::UnsignedInt(i) => {
-                output.push_str(&i.to_string());
+                output.put_slice(&i.to_string().into_bytes());
                 let c = match protocol_version {
                     ProtocolVersion::V1 => 'i',
                     ProtocolVersion::V2 => 'u',
                 };
-                output.push(c);
+                let mut c_buffer: [u8; 4] = [0; 4];
+                output.put_slice(c.encode_utf8(&mut c_buffer).as_bytes());
             }
             Field::Int(i) => {
-                output.push_str(&i.to_string());
-                output.push('i');
+                output.put_slice(&i.to_string().into_bytes());
+                output.put_u8(b'i');
             }
             Field::Bool(b) => {
-                output.push_str(&b.to_string());
+                output.put_slice(&b.to_string().into_bytes());
             }
         };
-        output.push(',');
+        output.put_u8(b',');
     }
 
     // remove last ','
-    output.pop();
+    if output.len() > original_len {
+        output.truncate(output.len() - 1);
+    }
 }
 
-fn encode_string(key: String, output: &mut String) {
+fn encode_string(key: &str, output: &mut BytesMut) {
     for c in key.chars() {
         if "\\, =".contains(c) {
-            output.push('\\');
+            output.put_u8(b'\\');
         }
-        output.push(c);
+        let mut c_buffer: [u8; 4] = [0; 4];
+        output.put_slice(c.encode_utf8(&mut c_buffer).as_bytes());
     }
 }
 
 pub(in crate::sinks) fn encode_timestamp(timestamp: Option<DateTime<Utc>>) -> i64 {
     if let Some(ts) = timestamp {
-        ts.timestamp_nanos()
+        ts.timestamp_nanos_opt().unwrap()
     } else {
         encode_timestamp(Some(Utc::now()))
     }
@@ -302,38 +371,41 @@ pub(in crate::sinks) fn encode_uri(
         url.pop();
     }
 
-    Ok(url.parse::<Uri>().context(super::UriParseError)?)
+    Ok(url.parse::<Uri>().context(super::UriParseSnafu)?)
 }
 
 #[cfg(test)]
 #[allow(dead_code)]
 pub mod test_util {
+    use std::{fs::File, io::Read};
+
+    use chrono::{offset::TimeZone, DateTime, SecondsFormat, Timelike, Utc};
+    use vector_lib::metric_tags;
+
     use super::*;
     use crate::tls;
-    use chrono::{offset::TimeZone, DateTime, SecondsFormat, Utc};
-    use std::fs::File;
-    use std::io::Read;
 
     pub(crate) const ORG: &str = "my-org";
     pub(crate) const BUCKET: &str = "my-bucket";
     pub(crate) const TOKEN: &str = "my-token";
 
     pub(crate) fn next_database() -> String {
-        format!("testdb{}", Utc::now().timestamp_nanos())
+        format!("testdb{}", Utc::now().timestamp_nanos_opt().unwrap())
     }
 
     pub(crate) fn ts() -> DateTime<Utc> {
-        Utc.ymd(2018, 11, 14).and_hms_nano(8, 9, 10, 11)
+        Utc.with_ymd_and_hms(2018, 11, 14, 8, 9, 10)
+            .single()
+            .and_then(|t| t.with_nanosecond(11))
+            .expect("invalid timestamp")
     }
 
-    pub(crate) fn tags() -> BTreeMap<String, String> {
-        vec![
-            ("normal_tag".to_owned(), "value".to_owned()),
-            ("true_tag".to_owned(), "true".to_owned()),
-            ("empty_tag".to_owned(), "".to_owned()),
-        ]
-        .into_iter()
-        .collect()
+    pub(crate) fn tags() -> MetricTags {
+        metric_tags!(
+            "normal_tag" => "value",
+            "true_tag" => "true",
+            "empty_tag" => "",
+        )
     }
 
     pub(crate) fn assert_fields(value: String, fields: Vec<&str>) {
@@ -351,6 +423,20 @@ pub mod test_util {
         }
     }
 
+    pub(crate) fn address_v1(secure: bool) -> String {
+        if secure {
+            std::env::var("INFLUXDB_V1_HTTPS_ADDRESS")
+                .unwrap_or_else(|_| "http://localhost:8087".into())
+        } else {
+            std::env::var("INFLUXDB_V1_HTTP_ADDRESS")
+                .unwrap_or_else(|_| "http://localhost:8086".into())
+        }
+    }
+
+    pub(crate) fn address_v2() -> String {
+        std::env::var("INFLUXDB_V2_ADDRESS").unwrap_or_else(|_| "http://localhost:9999".into())
+    }
+
     // ns.requests,metric_type=distribution,normal_tag=value,true_tag=true avg=1.875,count=8,max=3,median=2,min=1,quantile_0.95=3,sum=15 1542182950000000011
     //
     // =>
@@ -361,12 +447,12 @@ pub mod test_util {
     // 1542182950000000011
     //
     pub(crate) fn split_line_protocol(line_protocol: &str) -> (&str, &str, String, &str) {
-        let mut split = line_protocol.splitn(2, ',').collect::<Vec<&str>>();
-        let measurement = split[0];
+        let (name, fields) = line_protocol.split_once(' ').unwrap_or_default();
+        // tags and timestamp may not be present
+        let (measurement, tags) = name.split_once(',').unwrap_or((name, ""));
+        let (fields, ts) = fields.split_once(' ').unwrap_or((fields, ""));
 
-        split = split[1].splitn(3, ' ').collect::<Vec<&str>>();
-
-        (measurement, split[0], split[1].to_string(), split[2])
+        (measurement, tags, fields.to_string(), ts)
     }
 
     fn client() -> reqwest::Client {
@@ -385,7 +471,7 @@ pub mod test_util {
 
     pub(crate) async fn query_v1(endpoint: &str, query: &str) -> reqwest::Response {
         client()
-            .get(&format!("{}/query", endpoint))
+            .get(format!("{}/query", endpoint))
             .query(&[("q", query)])
             .send()
             .await
@@ -432,7 +518,7 @@ pub mod test_util {
         assert_eq!(status, http::StatusCode::OK, "UnexpectedStatus: {}", status);
     }
 
-    pub(crate) async fn onboarding_v2() {
+    pub(crate) async fn onboarding_v2(endpoint: &str) {
         let mut body = std::collections::HashMap::new();
         body.insert("username", "my-user");
         body.insert("password", "my-password");
@@ -446,7 +532,7 @@ pub mod test_util {
             .unwrap();
 
         let res = client
-            .post("http://localhost:9999/api/v2/setup")
+            .post(format!("{}/api/v2/setup", endpoint))
             .json(&body)
             .header("accept", "application/json")
             .send()
@@ -479,6 +565,8 @@ pub mod test_util {
 
 #[cfg(test)]
 mod tests {
+    use serde::{Deserialize, Serialize};
+
     use super::*;
     use crate::sinks::influxdb::test_util::{assert_fields, tags, ts};
 
@@ -502,19 +590,19 @@ mod tests {
         let config: InfluxDbTestConfig = toml::from_str(config).unwrap();
         let settings = influxdb_settings(config.influxdb1_settings, config.influxdb2_settings);
         assert_eq!(
-            format!("{}", settings.expect_err("expected error")),
-            "Unclear settings. Both version configured v1: InfluxDb1Settings { database: \"my-database\", consistency: None, retention_policy_name: None, username: None, password: None }, v2: InfluxDb2Settings { org: \"my-org\", bucket: \"my-bucket\", token: \"my-token\" }.".to_owned()
+            settings.expect_err("expected error").to_string(),
+            "Unclear settings. Both version configured v1: InfluxDb1Settings { database: \"my-database\", consistency: None, retention_policy_name: None, username: None, password: None }, v2: InfluxDb2Settings { org: \"my-org\", bucket: \"my-bucket\", token: \"**REDACTED**\" }.".to_owned()
         );
     }
 
     #[test]
     fn test_influxdb_settings_missing() {
-        let config = r#"
-    "#;
+        let config = r"
+    ";
         let config: InfluxDbTestConfig = toml::from_str(config).unwrap();
         let settings = influxdb_settings(config.influxdb1_settings, config.influxdb2_settings);
         assert_eq!(
-            format!("{}", settings.expect_err("expected error")),
+            settings.expect_err("expected error").to_string(),
             "InfluxDB v1 or v2 should be configured as endpoint.".to_owned()
         );
     }
@@ -525,7 +613,7 @@ mod tests {
         database = "my-database"
     "#;
         let config: InfluxDbTestConfig = toml::from_str(config).unwrap();
-        let _ = influxdb_settings(config.influxdb1_settings, config.influxdb2_settings).unwrap();
+        _ = influxdb_settings(config.influxdb1_settings, config.influxdb2_settings).unwrap();
     }
 
     #[test]
@@ -536,7 +624,7 @@ mod tests {
         token = "my-token"
     "#;
         let config: InfluxDbTestConfig = toml::from_str(config).unwrap();
-        let _ = influxdb_settings(config.influxdb1_settings, config.influxdb2_settings).unwrap();
+        _ = influxdb_settings(config.influxdb1_settings, config.influxdb2_settings).unwrap();
     }
 
     #[test]
@@ -546,7 +634,7 @@ mod tests {
             database: "vector_db".to_owned(),
             retention_policy_name: Some("autogen".to_owned()),
             username: Some("writer".to_owned()),
-            password: Some("secret".to_owned()),
+            password: Some("secret".to_owned().into()),
         };
 
         let uri = settings
@@ -560,7 +648,7 @@ mod tests {
         let settings = InfluxDb2Settings {
             org: "my-org".to_owned(),
             bucket: "my-bucket".to_owned(),
-            token: "my-token".to_owned(),
+            token: "my-token".to_owned().into(),
         };
 
         let uri = settings
@@ -579,7 +667,7 @@ mod tests {
             database: "vector_db".to_owned(),
             retention_policy_name: Some("autogen".to_owned()),
             username: Some("writer".to_owned()),
-            password: Some("secret".to_owned()),
+            password: Some("secret".to_owned().into()),
         };
 
         let uri = settings
@@ -593,7 +681,7 @@ mod tests {
         let settings = InfluxDb2Settings {
             org: "my-org".to_owned(),
             bucket: "my-bucket".to_owned(),
-            token: "my-token".to_owned(),
+            token: "my-token".to_owned().into(),
         };
 
         let uri = settings
@@ -604,7 +692,7 @@ mod tests {
 
     #[test]
     fn test_encode_tags() {
-        let mut value = String::new();
+        let mut value = BytesMut::new();
         encode_tags(tags(), &mut value);
 
         assert_eq!(value, "normal_tag=value,true_tag=true");
@@ -618,7 +706,7 @@ mod tests {
         .into_iter()
         .collect();
 
-        let mut value = String::new();
+        let mut value = BytesMut::new();
         encode_tags(tags_to_escape, &mut value);
         assert_eq!(
             value,
@@ -628,7 +716,7 @@ mod tests {
 
     #[test]
     fn tags_order() {
-        let mut value = String::new();
+        let mut value = BytesMut::new();
         encode_tags(
             vec![
                 ("a", "value"),
@@ -648,26 +736,24 @@ mod tests {
     #[test]
     fn test_encode_fields_v1() {
         let fields = vec![
+            ("field_string".into(), Field::String("string value".into())),
             (
-                "field_string".to_owned(),
-                Field::String("string value".to_owned()),
+                "field_string_escape".into(),
+                Field::String("string\\val\"ue".into()),
             ),
-            (
-                "field_string_escape".to_owned(),
-                Field::String("string\\val\"ue".to_owned()),
-            ),
-            ("field_float".to_owned(), Field::Float(123.45)),
-            ("field_unsigned_int".to_owned(), Field::UnsignedInt(657)),
-            ("field_int".to_owned(), Field::Int(657646)),
-            ("field_bool_true".to_owned(), Field::Bool(true)),
-            ("field_bool_false".to_owned(), Field::Bool(false)),
-            ("escape key".to_owned(), Field::Float(10.0)),
+            ("field_float".into(), Field::Float(123.45)),
+            ("field_unsigned_int".into(), Field::UnsignedInt(657)),
+            ("field_int".into(), Field::Int(657646)),
+            ("field_bool_true".into(), Field::Bool(true)),
+            ("field_bool_false".into(), Field::Bool(false)),
+            ("escape key".into(), Field::Float(10.0)),
         ]
         .into_iter()
         .collect();
 
-        let mut value = String::new();
+        let mut value = BytesMut::new();
         encode_fields(ProtocolVersion::V1, fields, &mut value);
+        let value = String::from_utf8(value.freeze().as_ref().to_owned()).unwrap();
         assert_fields(
             value,
             [
@@ -687,26 +773,24 @@ mod tests {
     #[test]
     fn test_encode_fields() {
         let fields = vec![
+            ("field_string".into(), Field::String("string value".into())),
             (
-                "field_string".to_owned(),
-                Field::String("string value".to_owned()),
+                "field_string_escape".into(),
+                Field::String("string\\val\"ue".into()),
             ),
-            (
-                "field_string_escape".to_owned(),
-                Field::String("string\\val\"ue".to_owned()),
-            ),
-            ("field_float".to_owned(), Field::Float(123.45)),
-            ("field_unsigned_int".to_owned(), Field::UnsignedInt(657)),
-            ("field_int".to_owned(), Field::Int(657646)),
-            ("field_bool_true".to_owned(), Field::Bool(true)),
-            ("field_bool_false".to_owned(), Field::Bool(false)),
-            ("escape key".to_owned(), Field::Float(10.0)),
+            ("field_float".into(), Field::Float(123.45)),
+            ("field_unsigned_int".into(), Field::UnsignedInt(657)),
+            ("field_int".into(), Field::Int(657646)),
+            ("field_bool_true".into(), Field::Bool(true)),
+            ("field_bool_false".into(), Field::Bool(false)),
+            ("escape key".into(), Field::Float(10.0)),
         ]
         .into_iter()
         .collect();
 
-        let mut value = String::new();
+        let mut value = BytesMut::new();
         encode_fields(ProtocolVersion::V2, fields, &mut value);
+        let value = String::from_utf8(value.freeze().as_ref().to_owned()).unwrap();
         assert_fields(
             value,
             [
@@ -725,26 +809,28 @@ mod tests {
 
     #[test]
     fn test_encode_string() {
-        let mut value = String::new();
-        encode_string("measurement_name".to_string(), &mut value);
+        let mut value = BytesMut::new();
+        encode_string("measurement_name", &mut value);
         assert_eq!(value, "measurement_name");
 
-        let mut value = String::new();
-        encode_string("measurement name".to_string(), &mut value);
+        let mut value = BytesMut::new();
+        encode_string("measurement name", &mut value);
         assert_eq!(value, "measurement\\ name");
 
-        let mut value = String::new();
-        encode_string("measurement=name".to_string(), &mut value);
+        let mut value = BytesMut::new();
+        encode_string("measurement=name", &mut value);
         assert_eq!(value, "measurement\\=name");
 
-        let mut value = String::new();
-        encode_string("measurement,name".to_string(), &mut value);
+        let mut value = BytesMut::new();
+        encode_string("measurement,name", &mut value);
         assert_eq!(value, "measurement\\,name");
     }
 
     #[test]
     fn test_encode_timestamp() {
-        let start = Utc::now().timestamp_nanos();
+        let start = Utc::now()
+            .timestamp_nanos_opt()
+            .expect("Timestamp out of range");
         assert_eq!(encode_timestamp(Some(ts())), 1542182950000000011);
         assert!(encode_timestamp(None) >= start)
     }
@@ -784,7 +870,7 @@ mod tests {
             "http://localhost:9999",
             "api/v2/write",
             &[
-                ("org", Some("Orgazniation name".to_owned())),
+                ("org", Some("Organization name".to_owned())),
                 ("bucket", Some("Bucket=name".to_owned())),
                 ("none", None),
             ],
@@ -792,7 +878,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             uri,
-            "http://localhost:9999/api/v2/write?org=Orgazniation+name&bucket=Bucket%3Dname"
+            "http://localhost:9999/api/v2/write?org=Organization+name&bucket=Bucket%3Dname"
         );
     }
 
@@ -818,21 +904,43 @@ mod integration_tests {
         http::HttpClient,
         sinks::influxdb::{
             healthcheck,
-            test_util::{next_database, onboarding_v2, BUCKET, ORG, TOKEN},
+            test_util::{address_v1, address_v2, next_database, onboarding_v2, BUCKET, ORG, TOKEN},
             InfluxDb1Settings, InfluxDb2Settings,
         },
     };
 
     #[tokio::test]
     async fn influxdb2_healthchecks_ok() {
-        onboarding_v2().await;
+        let endpoint = address_v2();
+        onboarding_v2(&endpoint).await;
 
-        let endpoint = "http://localhost:9999".to_string();
+        let endpoint = address_v2();
         let influxdb1_settings = None;
         let influxdb2_settings = Some(InfluxDb2Settings {
             org: ORG.to_string(),
             bucket: BUCKET.to_string(),
-            token: TOKEN.to_string(),
+            token: TOKEN.to_string().into(),
+        });
+        let proxy = ProxyConfig::default();
+        let client = HttpClient::new(None, &proxy).unwrap();
+
+        healthcheck(endpoint, influxdb1_settings, influxdb2_settings, client)
+            .unwrap()
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    #[should_panic]
+    async fn influxdb2_healthchecks_fail() {
+        let endpoint = "http://127.0.0.1:9999".to_string();
+        onboarding_v2(&endpoint).await;
+
+        let influxdb1_settings = None;
+        let influxdb2_settings = Some(InfluxDb2Settings {
+            org: ORG.to_string(),
+            bucket: BUCKET.to_string(),
+            token: TOKEN.to_string().into(),
         });
         let proxy = ProxyConfig::default();
         let client = HttpClient::new(None, &proxy).unwrap();
@@ -841,31 +949,12 @@ mod integration_tests {
             .unwrap()
             .await
             .unwrap();
-    }
-
-    #[tokio::test]
-    async fn influxdb2_healthchecks_fail() {
-        onboarding_v2().await;
-
-        let endpoint = "http://not_exist:9999".to_string();
-        let influxdb1_settings = None;
-        let influxdb2_settings = Some(InfluxDb2Settings {
-            org: ORG.to_string(),
-            bucket: BUCKET.to_string(),
-            token: TOKEN.to_string(),
-        });
-        let proxy = ProxyConfig::default();
-        let client = HttpClient::new(None, &proxy).unwrap();
-
-        healthcheck(endpoint, influxdb1_settings, influxdb2_settings, client)
-            .unwrap()
-            .await
-            .unwrap_err();
     }
 
     #[tokio::test]
     async fn influxdb1_healthchecks_ok() {
-        let endpoint = "http://localhost:8086".to_string();
+        let endpoint = address_v1(false);
+
         let influxdb1_settings = Some(InfluxDb1Settings {
             database: next_database(),
             consistency: None,
@@ -884,8 +973,9 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    #[should_panic]
     async fn influxdb1_healthchecks_fail() {
-        let endpoint = "http://not_exist:8086".to_string();
+        let endpoint = "http://127.0.0.1:8086".to_string();
         let influxdb1_settings = Some(InfluxDb1Settings {
             database: next_database(),
             consistency: None,
@@ -900,6 +990,6 @@ mod integration_tests {
         healthcheck(endpoint, influxdb1_settings, influxdb2_settings, client)
             .unwrap()
             .await
-            .unwrap_err();
+            .unwrap();
     }
 }

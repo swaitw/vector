@@ -1,74 +1,174 @@
-use super::errors::{ParseRecords, RequestError};
-use super::models::{EncodedFirehoseRecord, FirehoseRequest, FirehoseResponse};
-use super::Compression;
-use crate::codecs;
-use crate::sources::util::TcpError;
-use crate::{
-    config::log_schema,
-    event::Event,
-    internal_events::{
-        AwsKinesisFirehoseAutomaticRecordDecodeError, AwsKinesisFirehoseEventsReceived,
-    },
-    Pipeline,
-};
+use std::io::Read;
+
+use base64::prelude::{Engine as _, BASE64_STANDARD};
 use bytes::Bytes;
 use chrono::Utc;
 use flate2::read::MultiGzDecoder;
-use futures::{SinkExt, StreamExt, TryFutureExt};
+use futures::StreamExt;
 use snafu::{ResultExt, Snafu};
-use std::io::Read;
 use tokio_util::codec::FramedRead;
+use vector_common::constants::GZIP_MAGIC;
+use vector_lib::codecs::StreamDecodingError;
+use vector_lib::lookup::{metadata_path, path, PathPrefix};
+use vector_lib::{
+    config::{LegacyKey, LogNamespace},
+    event::BatchNotifier,
+    EstimatedJsonEncodedSizeOf,
+};
+use vector_lib::{
+    finalization::AddBatchNotifier,
+    internal_event::{
+        ByteSize, BytesReceived, CountByteSize, InternalEventHandle as _, Registered,
+    },
+};
+use vrl::compiler::SecretTarget;
 use warp::reject;
 
+use super::{
+    errors::{ParseRecordsSnafu, RequestError},
+    models::{EncodedFirehoseRecord, FirehoseRequest, FirehoseResponse},
+    Compression,
+};
+use crate::{
+    codecs::Decoder,
+    config::log_schema,
+    event::{BatchStatus, Event},
+    internal_events::{
+        AwsKinesisFirehoseAutomaticRecordDecodeError, EventsReceived, StreamClosedError,
+    },
+    sources::aws_kinesis_firehose::AwsKinesisFirehoseConfig,
+    SourceSender,
+};
+
+#[derive(Clone)]
+pub(super) struct Context {
+    pub(super) compression: Compression,
+    pub(super) store_access_key: bool,
+    pub(super) decoder: Decoder,
+    pub(super) acknowledgements: bool,
+    pub(super) bytes_received: Registered<BytesReceived>,
+    pub(super) out: SourceSender,
+    pub(super) log_namespace: LogNamespace,
+}
+
 /// Publishes decoded events from the FirehoseRequest to the pipeline
-pub async fn firehose(
+pub(super) async fn firehose(
     request_id: String,
     source_arn: String,
     request: FirehoseRequest,
-    compression: Compression,
-    decoder: codecs::Decoder,
-    mut out: Pipeline,
+    mut context: Context,
 ) -> Result<impl warp::Reply, reject::Rejection> {
+    let log_namespace = context.log_namespace;
+    let events_received = register!(EventsReceived);
+
     for record in request.records {
-        let bytes = decode_record(&record, compression)
-            .with_context(|| ParseRecords {
+        let bytes = decode_record(&record, context.compression)
+            .with_context(|_| ParseRecordsSnafu {
                 request_id: request_id.clone(),
             })
             .map_err(reject::custom)?;
+        context.bytes_received.emit(ByteSize(bytes.len()));
 
-        let mut stream = FramedRead::new(bytes.as_ref(), decoder.clone());
+        let mut stream = FramedRead::new(bytes.as_ref(), context.decoder.clone());
         loop {
             match stream.next().await {
-                Some(Ok((events, byte_size))) => {
-                    emit!(&AwsKinesisFirehoseEventsReceived {
-                        count: events.len(),
-                        byte_size
-                    });
+                Some(Ok((mut events, _byte_size))) => {
+                    events_received.emit(CountByteSize(
+                        events.len(),
+                        events.estimated_json_encoded_size_of(),
+                    ));
 
-                    for mut event in events {
-                        if let Event::Log(ref mut log) = event {
-                            log.try_insert(
-                                log_schema().source_type_key(),
-                                Bytes::from("aws_kinesis_firehose"),
-                            );
-                            log.try_insert(log_schema().timestamp_key(), request.timestamp);
-                            log.try_insert_flat("request_id", request_id.to_string());
-                            log.try_insert_flat("source_arn", source_arn.to_string());
+                    let (batch, receiver) = context
+                        .acknowledgements
+                        .then(|| {
+                            let (batch, receiver) = BatchNotifier::new_with_receiver();
+                            (Some(batch), Some(receiver))
+                        })
+                        .unwrap_or((None, None));
+
+                    let now = Utc::now();
+                    for event in &mut events {
+                        if let Some(batch) = &batch {
+                            event.add_batch_notifier(batch.clone());
                         }
+                        if let Event::Log(ref mut log) = event {
+                            log_namespace.insert_vector_metadata(
+                                log,
+                                log_schema().source_type_key(),
+                                path!("source_type"),
+                                Bytes::from_static(AwsKinesisFirehoseConfig::NAME.as_bytes()),
+                            );
+                            // This handles the transition from the original timestamp logic. Originally the
+                            // `timestamp_key` was always populated by the `request.timestamp` time.
+                            match log_namespace {
+                                LogNamespace::Vector => {
+                                    log.insert(metadata_path!("vector", "ingest_timestamp"), now);
+                                    log.insert(
+                                        metadata_path!(AwsKinesisFirehoseConfig::NAME, "timestamp"),
+                                        request.timestamp,
+                                    );
+                                }
+                                LogNamespace::Legacy => {
+                                    if let Some(timestamp_key) = log_schema().timestamp_key() {
+                                        log.try_insert(
+                                            (PathPrefix::Event, timestamp_key),
+                                            request.timestamp,
+                                        );
+                                    }
+                                }
+                            };
 
-                        out.send(event)
-                            .map_err(|error| {
-                                let error = RequestError::ShuttingDown {
+                            log_namespace.insert_source_metadata(
+                                AwsKinesisFirehoseConfig::NAME,
+                                log,
+                                Some(LegacyKey::InsertIfEmpty(path!("request_id"))),
+                                path!("request_id"),
+                                request_id.to_owned(),
+                            );
+                            log_namespace.insert_source_metadata(
+                                AwsKinesisFirehoseConfig::NAME,
+                                log,
+                                Some(LegacyKey::InsertIfEmpty(path!("source_arn"))),
+                                path!("source_arn"),
+                                source_arn.to_owned(),
+                            );
+
+                            if context.store_access_key {
+                                if let Some(access_key) = &request.access_key {
+                                    log.metadata_mut().secrets_mut().insert_secret(
+                                        "aws_kinesis_firehose_access_key",
+                                        access_key,
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    let count = events.len();
+                    if let Err(error) = context.out.send_batch(events).await {
+                        emit!(StreamClosedError { count });
+                        let error = RequestError::ShuttingDown {
+                            request_id: request_id.clone(),
+                            source: error,
+                        };
+                        warp::reject::custom(error);
+                    }
+
+                    drop(batch);
+                    if let Some(receiver) = receiver {
+                        match receiver.await {
+                            BatchStatus::Delivered => Ok(()),
+                            BatchStatus::Rejected => {
+                                Err(warp::reject::custom(RequestError::DeliveryFailed {
                                     request_id: request_id.clone(),
-                                    source: error,
-                                };
-                                // can only fail if receiving end disconnected, so we are shutting
-                                // down, probably not gracefully.
-                                error!(message = "Failed to forward events, downstream is closed.");
-                                error!(message = "Tried to send the following event.", %error);
-                                warp::reject::custom(error)
-                            })
-                            .await?;
+                                }))
+                            }
+                            BatchStatus::Errored => {
+                                Err(warp::reject::custom(RequestError::DeliveryErrored {
+                                    request_id: request_id.clone(),
+                                }))
+                            }
+                        }?;
                     }
                 }
                 Some(Err(error)) => {
@@ -106,7 +206,9 @@ fn decode_record(
     record: &EncodedFirehoseRecord,
     compression: Compression,
 ) -> Result<Bytes, RecordDecodeError> {
-    let buf = base64::decode(record.data.as_bytes()).context(Base64 {})?;
+    let buf = BASE64_STANDARD
+        .decode(record.data.as_bytes())
+        .context(Base64Snafu {})?;
 
     if buf.is_empty() {
         return Ok(Bytes::default());
@@ -114,26 +216,34 @@ fn decode_record(
 
     match compression {
         Compression::None => Ok(Bytes::from(buf)),
-        Compression::Gzip => decode_gzip(&buf[..]).with_context(|| Decompression {
+        Compression::Gzip => decode_gzip(&buf[..]).with_context(|_| DecompressionSnafu {
             compression: compression.to_owned(),
         }),
         Compression::Auto => {
-            match infer::get(&buf) {
-                Some(filetype) => match filetype.mime_type() {
-                    "application/gzip" => decode_gzip(&buf[..]).or_else(|error| {
-                        emit!(&AwsKinesisFirehoseAutomaticRecordDecodeError {
-                            compression: Compression::Gzip,
-                            error
-                        });
-                        Ok(Bytes::from(buf))
-                    }),
-                    // only support gzip for now
-                    _ => Ok(Bytes::from(buf)),
-                },
-                None => Ok(Bytes::from(buf)),
+            if is_gzip(&buf) {
+                decode_gzip(&buf[..]).or_else(|error| {
+                    emit!(AwsKinesisFirehoseAutomaticRecordDecodeError {
+                        compression: Compression::Gzip,
+                        error
+                    });
+                    Ok(Bytes::from(buf))
+                })
+            } else {
+                // only support gzip for now
+                Ok(Bytes::from(buf))
             }
         }
     }
+}
+
+fn is_gzip(data: &[u8]) -> bool {
+    // The header length of a GZIP file is 10 bytes. The first two bytes of the constant comes from
+    // the GZIP file format specification, which is the fixed member header identification bytes.
+    // The third byte is the compression method, of which only one is defined which is 8 for the
+    // deflate algorithm.
+    //
+    // Reference: https://datatracker.ietf.org/doc/html/rfc1952 Section 2.3
+    data.starts_with(GZIP_MAGIC)
 }
 
 fn decode_gzip(data: &[u8]) -> std::io::Result<Bytes> {
@@ -143,4 +253,23 @@ fn decode_gzip(data: &[u8]) -> std::io::Result<Bytes> {
     gz.read_to_end(&mut decoded)?;
 
     Ok(Bytes::from(decoded))
+}
+
+#[cfg(test)]
+mod tests {
+    use flate2::{write::GzEncoder, Compression};
+    use std::io::Write as _;
+
+    use super::*;
+
+    const CONTENT: &[u8] = b"Example";
+
+    #[test]
+    fn correctly_detects_gzipped_content() {
+        assert!(!is_gzip(CONTENT));
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(CONTENT).unwrap();
+        let compressed = encoder.finish().unwrap();
+        assert!(is_gzip(&compressed));
+    }
 }

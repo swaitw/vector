@@ -5,6 +5,10 @@ components: sources: splunk_hec: {
 
 	title: "Splunk HTTP Event Collector (HEC)"
 
+	description: """
+		This source exposes three HTTP endpoints at a configurable address that jointly implement the [Splunk HEC API](https://docs.splunk.com/Documentation/Splunk/9.0.3/Data/UsetheHTTPEventCollector): `/services/collector/event`, `/services/collector/raw`, and `/services/collector/health`.
+		"""
+
 	classes: {
 		commonly_used: false
 		delivery:      "at_least_once"
@@ -15,10 +19,12 @@ components: sources: splunk_hec: {
 	}
 
 	features: {
+		auto_generated:   true
+		acknowledgements: true
 		multiline: enabled: false
 		receive: {
 			from: {
-				service: services.splunk
+				service: services.splunk_client
 
 				interface: socket: {
 					api: {
@@ -34,7 +40,6 @@ components: sources: splunk_hec: {
 
 			tls: {
 				enabled:                true
-				can_enable:             true
 				can_verify_certificate: true
 				enabled_default:        false
 			}
@@ -42,16 +47,6 @@ components: sources: splunk_hec: {
 	}
 
 	support: {
-		targets: {
-			"aarch64-unknown-linux-gnu":      true
-			"aarch64-unknown-linux-musl":     true
-			"armv7-unknown-linux-gnueabihf":  true
-			"armv7-unknown-linux-musleabihf": true
-			"x86_64-apple-darwin":            true
-			"x86_64-pc-windows-msv":          true
-			"x86_64-unknown-linux-gnu":       true
-			"x86_64-unknown-linux-musl":      true
-		}
 		requirements: []
 		warnings: []
 		notices: []
@@ -61,42 +56,7 @@ components: sources: splunk_hec: {
 		platform_name: null
 	}
 
-	configuration: {
-		address: {
-			common:      true
-			description: "The address to accept connections on."
-			required:    false
-			warnings: []
-			type: string: {
-				default: "0.0.0.0:\(_port)"
-				syntax:  "literal"
-			}
-		}
-		token: {
-			common:      true
-			description: "If supplied, incoming requests must supply this token in the `Authorization` header, just as a client would if it was communicating with the Splunk HEC endpoint directly. If _not_ supplied, the `Authorization` header will be ignored and requests will not be authenticated."
-			required:    false
-			warnings: ["This option has been deprecated, the `valid_tokens` option should be used."]
-			type: string: {
-				default: null
-				examples: ["A94A8FE5CCB19BA61C4C08"]
-				syntax: "literal"
-			}
-		}
-		valid_tokens: {
-			common:      true
-			description: "If supplied, incoming requests must supply one of these tokens in the `Authorization` header, just as a client would if it was communicating with the Splunk HEC endpoint directly. If _not_ supplied, the `Authorization` header will be ignored and requests will not be authenticated."
-			required:    false
-			warnings: []
-			type: array: {
-				default: null
-				items: type: string: {
-					examples: ["A94A8FE5CCB19BA61C4C08"]
-					syntax: "literal"
-				}
-			}
-		}
-	}
+	configuration: base.components.sources.splunk_hec.configuration
 
 	output: logs: event: {
 		description: "A single event"
@@ -107,17 +67,30 @@ components: sources: splunk_hec: {
 				required:    true
 				type: timestamp: {}
 			}
+			source_type: {
+				description: "The name of the source type."
+				required:    true
+				type: string: {
+					examples: ["splunk_hec"]
+				}
+			}
 			timestamp: fields._current_timestamp
 		}
 	}
 
 	telemetry: metrics: {
-		component_errors_total:               components.sources.internal_metrics.output.metrics.component_errors_total
-		component_received_bytes_total:       components.sources.internal_metrics.output.metrics.component_received_bytes_total
-		component_received_event_bytes_total: components.sources.internal_metrics.output.metrics.component_received_event_bytes_total
-		component_received_events_total:      components.sources.internal_metrics.output.metrics.component_received_events_total
-		events_in_total:                      components.sources.internal_metrics.output.metrics.events_in_total
-		http_request_errors_total:            components.sources.internal_metrics.output.metrics.http_request_errors_total
-		requests_received_total:              components.sources.internal_metrics.output.metrics.requests_received_total
+		http_server_handler_duration_seconds: components.sources.internal_metrics.output.metrics.http_server_handler_duration_seconds
+		http_server_requests_received_total:  components.sources.internal_metrics.output.metrics.http_server_requests_received_total
+		http_server_responses_sent_total:     components.sources.internal_metrics.output.metrics.http_server_responses_sent_total
+	}
+
+	how_it_works: {
+		indexer_acknowledgements: {
+			title: "Indexer Acknowledgements"
+			body: """
+				With acknowledgements enabled, the source uses the [Splunk HEC indexer acknowledgements protocol](https://docs.splunk.com/Documentation/Splunk/8.2.3/Data/AboutHECIDXAck) to allow clients to verify data has been delivered to destination sinks.
+				To summarize the protocol, each request to the source is associated with an integer identifier (an ack id) that the client is given and can use to query for the status of the request.
+				"""
+		}
 	}
 }

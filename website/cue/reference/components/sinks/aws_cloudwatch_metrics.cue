@@ -13,14 +13,15 @@ components: sinks: aws_cloudwatch_metrics: components._aws & {
 	}
 
 	features: {
-		buffer: enabled:      false
+		acknowledgements: true
+		auto_generated:   true
 		healthcheck: enabled: true
 		send: {
 			batch: {
 				enabled:      true
 				common:       false
 				max_events:   20
-				timeout_secs: 1
+				timeout_secs: 1.0
 			}
 			compression: {
 				enabled: true
@@ -31,7 +32,13 @@ components: sinks: aws_cloudwatch_metrics: components._aws & {
 			encoding: enabled: false
 			proxy: enabled:    true
 			request: enabled:  false
-			tls: enabled:      false
+			tls: {
+				enabled:                true
+				can_verify_certificate: true
+				can_verify_hostname:    true
+				enabled_default:        true
+				enabled_by_scheme:      true
+			}
 			to: {
 				service: services.aws_cloudwatch_metrics
 
@@ -51,16 +58,6 @@ components: sinks: aws_cloudwatch_metrics: components._aws & {
 	}
 
 	support: {
-		targets: {
-			"aarch64-unknown-linux-gnu":      true
-			"aarch64-unknown-linux-musl":     true
-			"armv7-unknown-linux-gnueabihf":  true
-			"armv7-unknown-linux-musleabihf": true
-			"x86_64-apple-darwin":            true
-			"x86_64-pc-windows-msv":          true
-			"x86_64-unknown-linux-gnu":       true
-			"x86_64-unknown-linux-musl":      true
-		}
 		requirements: []
 		warnings: [
 			"""
@@ -86,19 +83,8 @@ components: sinks: aws_cloudwatch_metrics: components._aws & {
 		]
 	}
 
-	configuration: {
-		default_namespace: {
-			description: """
-				A [namespace](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/cloudwatch_concepts.html#Namespace) that will isolate different metrics from each other.
-				Used as a namespace for metrics that don't have it.
-				"""
-			required: true
-			warnings: []
-			type: string: {
-				examples: ["service"]
-				syntax: "literal"
-			}
-		}
+	configuration: base.components.sinks.aws_cloudwatch_metrics.configuration & {
+		_aws_include: false
 	}
 
 	input: {
@@ -111,6 +97,7 @@ components: sinks: aws_cloudwatch_metrics: components._aws & {
 			set:          false
 			summary:      false
 		}
+		traces: false
 	}
 
 	permissions: iam: [
@@ -127,9 +114,4 @@ components: sinks: aws_cloudwatch_metrics: components._aws & {
 			]
 		},
 	]
-
-	telemetry: metrics: {
-		component_sent_events_total:      components.sources.internal_metrics.output.metrics.component_sent_events_total
-		component_sent_event_bytes_total: components.sources.internal_metrics.output.metrics.component_sent_event_bytes_total
-	}
 }

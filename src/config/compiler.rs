@@ -1,8 +1,10 @@
 use super::{
-    builder::ConfigBuilder, graph::Graph, validation, ComponentKey, Config, ExpandType, OutputId,
-    TransformOuter,
+    builder::ConfigBuilder, graph::Graph, transform::get_transform_output_ids, validation, Config,
+    OutputId,
 };
+
 use indexmap::{IndexMap, IndexSet};
+use vector_lib::id::Inputs;
 
 pub fn compile(mut builder: ConfigBuilder) -> Result<(Config, Vec<String>), Vec<String>> {
     let mut errors = Vec::new();
@@ -20,8 +22,6 @@ pub fn compile(mut builder: ConfigBuilder) -> Result<(Config, Vec<String>), Vec<
         errors.extend(name_errors);
     }
 
-    let expansions = expand_macros(&mut builder)?;
-
     expand_globs(&mut builder);
 
     if let Err(type_errors) = validation::check_shape(&builder) {
@@ -32,12 +32,15 @@ pub fn compile(mut builder: ConfigBuilder) -> Result<(Config, Vec<String>), Vec<
         errors.extend(type_errors);
     }
 
+    if let Err(output_errors) = validation::check_outputs(&builder) {
+        errors.extend(output_errors);
+    }
+
     let ConfigBuilder {
         global,
         #[cfg(feature = "api")]
         api,
-        #[cfg(feature = "datadog-pipelines")]
-        datadog,
+        schema,
         healthchecks,
         enrichment_tables,
         sources,
@@ -45,9 +48,21 @@ pub fn compile(mut builder: ConfigBuilder) -> Result<(Config, Vec<String>), Vec<
         transforms,
         tests,
         provider: _,
+        secret,
+        graceful_shutdown_duration,
+        allow_empty: _,
     } = builder;
+    let all_sinks = sinks
+        .clone()
+        .into_iter()
+        .chain(
+            enrichment_tables
+                .iter()
+                .filter_map(|(key, table)| table.as_sink().map(|s| (key.clone(), s))),
+        )
+        .collect::<IndexMap<_, _>>();
 
-    let graph = match Graph::new(&sources, &transforms, &sinks) {
+    let graph = match Graph::new(&sources, &transforms, &all_sinks, schema) {
         Ok(graph) => graph,
         Err(graph_errors) => {
             errors.extend(graph_errors);
@@ -57,6 +72,10 @@ pub fn compile(mut builder: ConfigBuilder) -> Result<(Config, Vec<String>), Vec<
 
     if let Err(type_errors) = graph.typecheck() {
         errors.extend(type_errors);
+    }
+
+    if let Err(e) = graph.check_for_cycles() {
+        errors.push(e);
     }
 
     // Inputs are resolved from string into OutputIds as part of graph construction, so update them
@@ -75,22 +94,35 @@ pub fn compile(mut builder: ConfigBuilder) -> Result<(Config, Vec<String>), Vec<
             (key, transform.with_inputs(inputs))
         })
         .collect();
+    let enrichment_tables = enrichment_tables
+        .into_iter()
+        .map(|(key, table)| {
+            let inputs = graph.inputs_for(&key);
+            (key, table.with_inputs(inputs))
+        })
+        .collect();
+    let tests = tests
+        .into_iter()
+        .map(|test| test.resolve_outputs(&graph))
+        .collect::<Result<Vec<_>, Vec<_>>>()?;
 
     if errors.is_empty() {
-        let config = Config {
+        let mut config = Config {
             global,
             #[cfg(feature = "api")]
             api,
-            #[cfg(feature = "datadog-pipelines")]
-            datadog,
+            schema,
             healthchecks,
             enrichment_tables,
             sources,
             sinks,
             transforms,
             tests,
-            expansions,
+            secret,
+            graceful_shutdown_duration,
         };
+
+        config.propagate_acknowledgements()?;
 
         let warnings = validation::warnings(&config);
 
@@ -100,72 +132,24 @@ pub fn compile(mut builder: ConfigBuilder) -> Result<(Config, Vec<String>), Vec<
     }
 }
 
-/// Some component configs can act like macros and expand themselves into multiple replacement
-/// configs. Performs those expansions and records the relevant metadata.
-pub(super) fn expand_macros(
-    config: &mut ConfigBuilder,
-) -> Result<IndexMap<ComponentKey, Vec<ComponentKey>>, Vec<String>> {
-    let mut expanded_transforms = IndexMap::new();
-    let mut expansions = IndexMap::new();
-    let mut errors = Vec::new();
-
-    while let Some((k, mut t)) = config.transforms.pop() {
-        if let Some((expanded, expand_type)) = match t.inner.expand() {
-            Ok(e) => e,
-            Err(err) => {
-                errors.push(format!("failed to expand transform '{}': {}", k, err));
-                continue;
-            }
-        } {
-            let mut children = Vec::new();
-            let mut inputs = t.inputs.clone();
-
-            for (name, child) in expanded {
-                let full_name = ComponentKey::global(format!("{}.{}", k, name));
-
-                expanded_transforms.insert(
-                    full_name.clone(),
-                    TransformOuter {
-                        inputs,
-                        inner: child,
-                    },
-                );
-                children.push(full_name.clone());
-                inputs = match expand_type {
-                    ExpandType::Parallel => t.inputs.clone(),
-                    ExpandType::Serial => vec![full_name.to_string()],
-                }
-            }
-            expansions.insert(k.clone(), children);
-        } else {
-            expanded_transforms.insert(k, t);
-        }
-    }
-    config.transforms = expanded_transforms;
-
-    if !errors.is_empty() {
-        Err(errors)
-    } else {
-        Ok(expansions)
-    }
-}
-
 /// Expand globs in input lists
-fn expand_globs(config: &mut ConfigBuilder) {
+pub(crate) fn expand_globs(config: &mut ConfigBuilder) {
     let candidates = config
         .sources
-        .keys()
-        .chain(config.transforms.keys())
-        .map(ToString::to_string)
-        .chain(config.transforms.iter().flat_map(|(key, t)| {
-            t.inner.named_outputs().into_iter().map(move |port| {
-                OutputId {
+        .iter()
+        .flat_map(|(key, s)| {
+            s.inner
+                .outputs(config.schema.log_namespace())
+                .into_iter()
+                .map(|output| OutputId {
                     component: key.clone(),
-                    port: Some(port),
-                }
-                .to_string()
-            })
+                    port: output.port,
+                })
+        })
+        .chain(config.transforms.iter().flat_map(|(key, t)| {
+            get_transform_output_ids(t.inner.as_ref(), key.clone(), config.schema.log_namespace())
         }))
+        .map(|output_id| output_id.to_string())
         .collect::<IndexSet<String>>();
 
     for (id, transform) in config.transforms.iter_mut() {
@@ -193,7 +177,7 @@ impl InputMatcher {
     }
 }
 
-fn expand_globs_inner(inputs: &mut Vec<String>, id: &str, candidates: &IndexSet<String>) {
+fn expand_globs_inner(inputs: &mut Inputs<String>, id: &str, candidates: &IndexSet<String>) {
     let raw_inputs = std::mem::take(inputs);
     for raw_input in raw_inputs {
         let matcher = glob::Pattern::new(&raw_input)
@@ -206,13 +190,13 @@ fn expand_globs_inner(inputs: &mut Vec<String>, id: &str, candidates: &IndexSet<
         for input in candidates {
             if matcher.matches(input) && input != id {
                 matched = true;
-                inputs.push(input.clone())
+                inputs.extend(Some(input.to_string()))
             }
         }
         // If it didn't work as a glob pattern, leave it in the inputs as-is. This lets us give
-        // more accurate error messages about non-existent inputs.
+        // more accurate error messages about nonexistent inputs.
         if !matched {
-            inputs.push(raw_input)
+            inputs.extend(Some(raw_input))
         }
     }
 }
@@ -220,89 +204,19 @@ fn expand_globs_inner(inputs: &mut Vec<String>, id: &str, candidates: &IndexSet<
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::{
-        config::{
-            DataType, SinkConfig, SinkContext, SourceConfig, SourceContext, TransformConfig,
-            TransformContext,
-        },
-        sinks::{Healthcheck, VectorSink},
-        sources::Source,
-        transforms::Transform,
-    };
-    use async_trait::async_trait;
-    use serde::{Deserialize, Serialize};
-
-    #[derive(Debug, Serialize, Deserialize)]
-    struct MockSourceConfig;
-
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    struct MockTransformConfig;
-
-    #[derive(Debug, Serialize, Deserialize)]
-    struct MockSinkConfig;
-
-    #[async_trait]
-    #[typetag::serde(name = "mock")]
-    impl SourceConfig for MockSourceConfig {
-        async fn build(&self, _cx: SourceContext) -> crate::Result<Source> {
-            unimplemented!()
-        }
-
-        fn source_type(&self) -> &'static str {
-            "mock"
-        }
-
-        fn output_type(&self) -> DataType {
-            DataType::Any
-        }
-    }
-
-    #[async_trait]
-    #[typetag::serde(name = "mock")]
-    impl TransformConfig for MockTransformConfig {
-        async fn build(&self, _context: &TransformContext) -> crate::Result<Transform> {
-            unimplemented!()
-        }
-
-        fn transform_type(&self) -> &'static str {
-            "mock"
-        }
-
-        fn input_type(&self) -> DataType {
-            DataType::Any
-        }
-
-        fn output_type(&self) -> DataType {
-            DataType::Any
-        }
-    }
-
-    #[async_trait]
-    #[typetag::serde(name = "mock")]
-    impl SinkConfig for MockSinkConfig {
-        async fn build(&self, _cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
-            unimplemented!()
-        }
-
-        fn sink_type(&self) -> &'static str {
-            "mock"
-        }
-
-        fn input_type(&self) -> DataType {
-            DataType::Any
-        }
-    }
+    use crate::test_util::mock::{basic_sink, basic_source, basic_transform};
+    use vector_lib::config::ComponentKey;
 
     #[test]
     fn glob_expansion() {
         let mut builder = ConfigBuilder::default();
-        builder.add_source("foo1", MockSourceConfig);
-        builder.add_source("foo2", MockSourceConfig);
-        builder.add_source("bar", MockSourceConfig);
-        builder.add_transform("foos", &["foo*"], MockTransformConfig);
-        builder.add_sink("baz", &["foos*", "b*"], MockSinkConfig);
-        builder.add_sink("quix", &["*oo*"], MockSinkConfig);
-        builder.add_sink("quux", &["*"], MockSinkConfig);
+        builder.add_source("foo1", basic_source().1);
+        builder.add_source("foo2", basic_source().1);
+        builder.add_source("bar", basic_source().1);
+        builder.add_transform("foos", &["foo*"], basic_transform("", 1.0));
+        builder.add_sink("baz", &["foos*", "b*"], basic_sink(1).1);
+        builder.add_sink("quix", &["*oo*"], basic_sink(1).1);
+        builder.add_sink("quux", &["*"], basic_sink(1).1);
 
         let config = builder.build().expect("build should succeed");
 
@@ -349,7 +263,7 @@ mod test {
         );
     }
 
-    fn without_ports(outputs: Vec<OutputId>) -> Vec<ComponentKey> {
+    fn without_ports(outputs: Inputs<OutputId>) -> Vec<ComponentKey> {
         outputs
             .into_iter()
             .map(|output| {

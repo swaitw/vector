@@ -1,3 +1,11 @@
+use std::cmp::Ordering;
+
+use async_graphql::{Enum, InputObject, InputType};
+use itertools::{
+    FoldWhile::{Continue, Done},
+    Itertools,
+};
+
 use crate::api::schema::{
     components::{
         sink::SinksSortFieldName, source::SourcesSortFieldName, transform::TransformsSortFieldName,
@@ -5,23 +13,12 @@ use crate::api::schema::{
     },
     metrics::source::file::FileSourceMetricFilesSortFieldName,
 };
-use async_graphql::{Enum, InputObject, InputType};
-use itertools::{
-    FoldWhile::{Continue, Done},
-    Itertools,
-};
-use std::cmp::Ordering;
 
-#[derive(Enum, Copy, Clone, PartialEq, Eq)]
+#[derive(Enum, Copy, Clone, Default, PartialEq, Eq)]
 pub enum Direction {
+    #[default]
     Asc,
     Desc,
-}
-
-impl Default for Direction {
-    fn default() -> Self {
-        Direction::Asc
-    }
 }
 
 #[derive(InputObject)]
@@ -44,7 +41,7 @@ pub trait SortableByField<T: InputType> {
     fn sort(&self, rhs: &Self, field: &T) -> Ordering;
 }
 
-/// Performs an in-place sort against a slice of Sortable<T>, with the provided SortField<T>s
+/// Performs an in-place sort against a slice of `Sortable<T>`, with the provided [`SortField<T>`]s
 pub fn by_fields<T: InputType>(f: &mut [impl SortableByField<T>], sort_fields: &[SortField<T>]) {
     f.sort_by(|a, b| {
         sort_fields

@@ -13,7 +13,8 @@ components: sinks: aws_cloudwatch_logs: components._aws & {
 	}
 
 	features: {
-		buffer: enabled:      true
+		acknowledgements: true
+		auto_generated:   true
 		healthcheck: enabled: true
 		send: {
 			batch: {
@@ -21,7 +22,7 @@ components: sinks: aws_cloudwatch_logs: components._aws & {
 				common:       false
 				max_bytes:    1048576
 				max_events:   10000
-				timeout_secs: 1
+				timeout_secs: 1.0
 			}
 			compression: {
 				enabled: true
@@ -39,9 +40,15 @@ components: sinks: aws_cloudwatch_logs: components._aws & {
 			proxy: enabled: true
 			request: {
 				enabled: true
-				headers: false
+				headers: true
 			}
-			tls: enabled: false
+			tls: {
+				enabled:                true
+				can_verify_certificate: true
+				can_verify_hostname:    true
+				enabled_default:        true
+				enabled_by_scheme:      true
+			}
 			to: {
 				service: services.aws_cloudwatch_logs
 
@@ -61,55 +68,19 @@ components: sinks: aws_cloudwatch_logs: components._aws & {
 	}
 
 	support: {
-		targets: {
-			"aarch64-unknown-linux-gnu":      true
-			"aarch64-unknown-linux-musl":     true
-			"armv7-unknown-linux-gnueabihf":  true
-			"armv7-unknown-linux-musleabihf": true
-			"x86_64-apple-darwin":            true
-			"x86_64-pc-windows-msv":          true
-			"x86_64-unknown-linux-gnu":       true
-			"x86_64-unknown-linux-musl":      true
-		}
 		requirements: []
-		warnings: []
 		notices: []
+		warnings: []
 	}
 
-	configuration: {
-		create_missing_group: {
-			common:      true
-			description: "Dynamically create a [log group](\(urls.aws_cloudwatch_logs_group_name)) if it does not already exist. This will ignore `create_missing_stream` directly after creating the group and will create the first stream."
-			required:    false
-			type: bool: default: true
-		}
-		create_missing_stream: {
-			common:      true
-			description: "Dynamically create a [log stream](\(urls.aws_cloudwatch_logs_stream_name)) if it does not already exist."
-			required:    false
-			type: bool: default: true
-		}
-		group_name: {
-			description: "The [group name](\(urls.aws_cloudwatch_logs_group_name)) of the target CloudWatch Logs stream."
-			required:    true
-			type: string: {
-				examples: ["group-name", "{{ file }}"]
-				syntax: "template"
-			}
-		}
-		stream_name: {
-			description: "The [stream name](\(urls.aws_cloudwatch_logs_stream_name)) of the target CloudWatch Logs stream. Note that there can only be one writer to a log stream at a time so if you are running multiple vectors all writing to the same log group, include a identifier in the stream name that is guaranteed to be unique by vector instance (for example, you might choose `host`)"
-			required:    true
-			type: string: {
-				examples: ["{{ host }}", "%Y-%m-%d", "stream-name"]
-				syntax: "template"
-			}
-		}
+	configuration: base.components.sinks.aws_cloudwatch_logs.configuration & {
+		_aws_include: false
 	}
 
 	input: {
 		logs:    true
 		metrics: null
+		traces:  false
 	}
 
 	permissions: iam: [
@@ -139,11 +110,4 @@ components: sinks: aws_cloudwatch_logs: components._aws & {
 			]
 		},
 	]
-
-	telemetry: metrics: {
-		component_sent_events_total:      components.sources.internal_metrics.output.metrics.component_sent_events_total
-		component_sent_event_bytes_total: components.sources.internal_metrics.output.metrics.component_sent_event_bytes_total
-		events_discarded_total:           components.sources.internal_metrics.output.metrics.events_discarded_total
-		processing_errors_total:          components.sources.internal_metrics.output.metrics.processing_errors_total
-	}
 }

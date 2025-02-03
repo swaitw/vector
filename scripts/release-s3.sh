@@ -7,11 +7,13 @@ set -euo pipefail
 #
 #   Uploads archives and packages to S3
 
-CHANNEL="${CHANNEL:-"$(scripts/release-channel.sh)"}"
-VERSION="${VERSION:-"$(scripts/version.sh)"}"
+CHANNEL="${CHANNEL:-"$(cargo vdev release channel)"}"
+VERSION="${VECTOR_VERSION:-"$(cargo vdev version)"}"
 DATE="${DATE:-"$(date -u +%Y-%m-%d)"}"
 VERIFY_TIMEOUT="${VERIFY_TIMEOUT:-"30"}" # seconds
 VERIFY_RETRIES="${VERIFY_RETRIES:-"2"}"
+
+export AWS_REGION=us-east-1
 
 #
 # Setup
@@ -19,7 +21,6 @@ VERIFY_RETRIES="${VERIFY_RETRIES:-"2"}"
 
 td="$(mktemp -d)"
 cp -av "target/artifacts/." "$td"
-ls "$td"
 
 td_nightly="$(mktemp -d)"
 cp -av "target/artifacts/." "$td_nightly"
@@ -77,10 +78,8 @@ if [[ "$CHANNEL" == "nightly" ]]; then
   verify_artifact \
     "https://packages.timber.io/vector/nightly/latest/vector-nightly-x86_64-unknown-linux-gnu.tar.gz" \
     "$td_nightly/vector-nightly-x86_64-unknown-linux-gnu.tar.gz"
-  verify_artifact \
-    "https://packages.timber.io/vector/nightly/latest/vector-nightly-x86_64-unknown-linux-gnu-debug.tar.gz" \
-    "$td_nightly/vector-nightly-x86_64-unknown-linux-gnu-debug.tar.gz"
-elif [[ "$CHANNEL" == "latest" ]]; then
+
+elif [[ "$CHANNEL" == "release" ]]; then
   VERSION_EXACT="$VERSION"
   # shellcheck disable=SC2001
   VERSION_MINOR_X="$(echo "$VERSION" | sed 's/\.[0-9]*$/.X/g')"
@@ -129,6 +128,21 @@ elif [[ "$CHANNEL" == "latest" ]]; then
   verify_artifact \
     "https://packages.timber.io/vector/latest/vector-latest-x86_64-unknown-linux-gnu.tar.gz" \
     "$td/vector-$VERSION-x86_64-unknown-linux-gnu.tar.gz"
+
+elif [[ "$CHANNEL" == "custom" ]]; then
+
+  # Add custom files
+  echo "Uploading all artifacts to s3://packages.timber.io/vector/custom"
+  aws s3 cp "$td" "s3://packages.timber.io/vector/custom/$VERSION" --recursive --sse --acl public-read
+  echo "Uploaded archives"
+
+  # Verify that the files exist and can be downloaded
+  echo "Waiting for $VERIFY_TIMEOUT seconds before running the verifications"
+  sleep "$VERIFY_TIMEOUT"
+  verify_artifact \
+    "https://packages.timber.io/vector/custom/$VERSION/vector-$VERSION-x86_64-unknown-linux-gnu.tar.gz" \
+    "$td/vector-$VERSION-x86_64-unknown-linux-gnu.tar.gz"
+
 fi
 
 #

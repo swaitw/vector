@@ -1,9 +1,11 @@
-use pin_project::pin_project;
+#![allow(missing_docs)]
 use std::{
     future::Future,
     pin::Pin,
     task::{Context, Poll},
 };
+
+use pin_project::pin_project;
 use tokio::io::{AsyncRead, ReadBuf, Result as IoResult};
 
 pub trait VecAsyncReadExt: AsyncRead {
@@ -62,12 +64,14 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::shutdown::ShutdownSignal;
-    use crate::test_util::temp_file;
     use futures::FutureExt;
-    use tokio::fs::{remove_file, File};
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
+    use tokio::{
+        fs::{remove_file, File},
+        io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter},
+    };
+
+    use super::*;
+    use crate::{shutdown::ShutdownSignal, test_util::temp_file};
 
     #[tokio::test]
     async fn test_read_line_without_shutdown() {
@@ -87,7 +91,7 @@ mod tests {
 
         // Test one of the AsyncBufRead extension functions
         let mut line_one = String::new();
-        let _ = reader.read_line(&mut line_one).await;
+        _ = reader.read_line(&mut line_one).await;
 
         assert_eq!("First line\n", line_one);
 
@@ -95,7 +99,7 @@ mod tests {
         writer.flush().await.unwrap();
 
         let mut line_two = String::new();
-        let _ = reader.read_line(&mut line_two).await;
+        _ = reader.read_line(&mut line_two).await;
 
         assert_eq!("Second line\n", line_two);
 
@@ -120,7 +124,7 @@ mod tests {
 
         // Test one of the AsyncBufRead extension functions
         let mut line_one = String::new();
-        let _ = reader.read_line(&mut line_one).await;
+        _ = reader.read_line(&mut line_one).await;
 
         assert_eq!("First line\n", line_one);
 
@@ -130,7 +134,7 @@ mod tests {
         writer.flush().await.unwrap();
 
         let mut line_two = String::new();
-        let _ = reader.read_line(&mut line_two).await;
+        _ = reader.read_line(&mut line_two).await;
 
         assert_eq!("", line_two);
 

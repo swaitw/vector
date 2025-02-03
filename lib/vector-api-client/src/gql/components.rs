@@ -1,7 +1,8 @@
-use crate::{BoxedSubscription, QueryResult};
-use async_trait::async_trait;
-use graphql_client::GraphQLQuery;
 use std::fmt;
+
+use graphql_client::GraphQLQuery;
+
+use crate::{BoxedSubscription, QueryResult};
 
 /// Components query for returning sources, transforms, and sinks
 #[derive(GraphQLQuery, Debug, Copy, Clone)]
@@ -30,12 +31,10 @@ pub struct ComponentAddedSubscription;
 )]
 pub struct ComponentRemovedSubscription;
 
-#[async_trait]
 pub trait ComponentsQueryExt {
     async fn components_query(&self, first: i64) -> crate::QueryResult<ComponentsQuery>;
 }
 
-#[async_trait]
 impl ComponentsQueryExt for crate::Client {
     async fn components_query(&self, first: i64) -> QueryResult<ComponentsQuery> {
         let request_body = ComponentsQuery::build_query(components_query::Variables { first });
@@ -48,7 +47,6 @@ pub trait ComponentsSubscriptionExt {
     fn component_removed(&self) -> crate::BoxedSubscription<ComponentRemovedSubscription>;
 }
 
-#[async_trait]
 impl ComponentsSubscriptionExt for crate::SubscriptionClient {
     /// Subscription for when a component has been added
     fn component_added(&self) -> BoxedSubscription<ComponentAddedSubscription> {
@@ -68,49 +66,17 @@ impl ComponentsSubscriptionExt for crate::SubscriptionClient {
 }
 
 impl components_query::ComponentsQueryComponentsEdgesNodeOn {
-    pub fn processed_events_total(&self) -> i64 {
+    pub fn received_bytes_total(&self) -> i64 {
+        // This is network bytes received, and only sources can receive events.
         match self {
             components_query::ComponentsQueryComponentsEdgesNodeOn::Source(s) => s
                 .metrics
-                .processed_events_total
+                .received_bytes_total
                 .as_ref()
-                .map(|p| p.processed_events_total as i64)
+                .map(|p| p.received_bytes_total as i64)
                 .unwrap_or(0),
-            components_query::ComponentsQueryComponentsEdgesNodeOn::Transform(t) => t
-                .metrics
-                .processed_events_total
-                .as_ref()
-                .map(|p| p.processed_events_total as i64)
-                .unwrap_or(0),
-            components_query::ComponentsQueryComponentsEdgesNodeOn::Sink(s) => s
-                .metrics
-                .processed_events_total
-                .as_ref()
-                .map(|p| p.processed_events_total as i64)
-                .unwrap_or(0),
-        }
-    }
-
-    pub fn processed_bytes_total(&self) -> i64 {
-        match self {
-            components_query::ComponentsQueryComponentsEdgesNodeOn::Source(s) => s
-                .metrics
-                .processed_bytes_total
-                .as_ref()
-                .map(|p| p.processed_bytes_total as i64)
-                .unwrap_or(0),
-            components_query::ComponentsQueryComponentsEdgesNodeOn::Transform(t) => t
-                .metrics
-                .processed_bytes_total
-                .as_ref()
-                .map(|p| p.processed_bytes_total as i64)
-                .unwrap_or(0),
-            components_query::ComponentsQueryComponentsEdgesNodeOn::Sink(s) => s
-                .metrics
-                .processed_bytes_total
-                .as_ref()
-                .map(|p| p.processed_bytes_total as i64)
-                .unwrap_or(0),
+            components_query::ComponentsQueryComponentsEdgesNodeOn::Transform(_) => 0,
+            components_query::ComponentsQueryComponentsEdgesNodeOn::Sink(_) => 0,
         }
     }
 
@@ -137,6 +103,20 @@ impl components_query::ComponentsQueryComponentsEdgesNodeOn {
         }
     }
 
+    pub fn sent_bytes_total(&self) -> i64 {
+        // This is network bytes sent, and only sinks can send out events.
+        match self {
+            components_query::ComponentsQueryComponentsEdgesNodeOn::Source(_) => 0,
+            components_query::ComponentsQueryComponentsEdgesNodeOn::Transform(_) => 0,
+            components_query::ComponentsQueryComponentsEdgesNodeOn::Sink(s) => s
+                .metrics
+                .sent_bytes_total
+                .as_ref()
+                .map(|p| p.sent_bytes_total as i64)
+                .unwrap_or(0),
+        }
+    }
+
     pub fn sent_events_total(&self) -> i64 {
         match self {
             components_query::ComponentsQueryComponentsEdgesNodeOn::Source(s) => s
@@ -157,6 +137,38 @@ impl components_query::ComponentsQueryComponentsEdgesNodeOn {
                 .as_ref()
                 .map(|p| p.sent_events_total as i64)
                 .unwrap_or(0),
+        }
+    }
+
+    pub fn outputs(&self) -> Vec<(String, i64)> {
+        match self {
+            components_query::ComponentsQueryComponentsEdgesNodeOn::Source(s) => s
+                .outputs
+                .iter()
+                .map(|o| {
+                    (
+                        o.output_id.clone(),
+                        o.sent_events_total
+                            .as_ref()
+                            .map(|p| p.sent_events_total as i64)
+                            .unwrap_or(0),
+                    )
+                })
+                .collect(),
+            components_query::ComponentsQueryComponentsEdgesNodeOn::Transform(t) => t
+                .outputs
+                .iter()
+                .map(|o| {
+                    (
+                        o.output_id.clone(),
+                        o.sent_events_total
+                            .as_ref()
+                            .map(|p| p.sent_events_total as i64)
+                            .unwrap_or(0),
+                    )
+                })
+                .collect(),
+            components_query::ComponentsQueryComponentsEdgesNodeOn::Sink(_) => vec![],
         }
     }
 }

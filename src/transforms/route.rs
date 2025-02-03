@@ -1,91 +1,118 @@
+use indexmap::IndexMap;
+use vector_lib::config::{clone_input_definitions, LogNamespace};
+use vector_lib::configurable::configurable_component;
+use vector_lib::transform::SyncTransform;
+
 use crate::{
-    conditions::{AnyCondition, Condition},
+    conditions::{AnyCondition, Condition, ConditionConfig, VrlConfig},
     config::{
-        DataType, ExpandType, GenerateConfig, TransformConfig, TransformContext,
-        TransformDescription,
+        DataType, GenerateConfig, Input, OutputId, TransformConfig, TransformContext,
+        TransformOutput,
     },
     event::Event,
-    internal_events::RouteEventDiscarded,
-    transforms::{FunctionTransform, Transform},
+    schema,
+    transforms::Transform,
 };
-use indexmap::IndexMap;
-use serde::{Deserialize, Serialize};
 
-//------------------------------------------------------------------------------
+pub(crate) const UNMATCHED_ROUTE: &str = "_unmatched";
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(deny_unknown_fields)]
-pub struct LaneConfig {
-    condition: AnyCondition,
+#[derive(Clone)]
+pub struct Route {
+    conditions: Vec<(String, Condition)>,
+    reroute_unmatched: bool,
 }
 
-#[async_trait::async_trait]
-#[typetag::serde(name = "lane")]
-impl TransformConfig for LaneConfig {
-    async fn build(&self, context: &TransformContext) -> crate::Result<Transform> {
-        Ok(Transform::function(Lane::new(
-            self.condition.build(&context.enrichment_tables)?,
-        )))
-    }
-
-    fn input_type(&self) -> DataType {
-        DataType::Any
-    }
-
-    fn output_type(&self) -> DataType {
-        DataType::Any
-    }
-
-    fn transform_type(&self) -> &'static str {
-        "lane"
+impl Route {
+    pub fn new(config: &RouteConfig, context: &TransformContext) -> crate::Result<Self> {
+        let mut conditions = Vec::with_capacity(config.route.len());
+        for (output_name, condition) in config.route.iter() {
+            let condition = condition.build(&context.enrichment_tables)?;
+            conditions.push((output_name.clone(), condition));
+        }
+        Ok(Self {
+            conditions,
+            reroute_unmatched: config.reroute_unmatched,
+        })
     }
 }
 
-#[derive(Clone, Derivative)]
-#[derivative(Debug)]
-pub struct Lane {
-    #[derivative(Debug = "ignore")]
-    condition: Box<dyn Condition>,
-}
-
-impl Lane {
-    pub fn new(condition: Box<dyn Condition>) -> Self {
-        Self { condition }
-    }
-}
-
-impl FunctionTransform for Lane {
-    fn transform(&mut self, output: &mut Vec<Event>, event: Event) {
-        if self.condition.check(&event) {
-            output.push(event);
-        } else {
-            emit!(&RouteEventDiscarded);
+impl SyncTransform for Route {
+    fn transform(&mut self, event: Event, output: &mut vector_lib::transform::TransformOutputsBuf) {
+        let mut check_failed: usize = 0;
+        for (output_name, condition) in &self.conditions {
+            let (result, event) = condition.check(event.clone());
+            if result {
+                output.push(Some(output_name), event);
+            } else {
+                check_failed += 1;
+            }
+        }
+        if self.reroute_unmatched && check_failed == self.conditions.len() {
+            output.push(Some(UNMATCHED_ROUTE), event);
         }
     }
 }
 
-//------------------------------------------------------------------------------
-
-#[derive(Deserialize, Serialize, Debug, Clone)]
+/// Configuration for the `route` transform.
+#[configurable_component(transform(
+    "route",
+    "Split a stream of events into multiple sub-streams based on user-supplied conditions."
+))]
+#[derive(Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct RouteConfig {
-    // Deprecated name
-    #[serde(alias = "lanes")]
+    /// Reroutes unmatched events to a named output instead of silently discarding them.
+    ///
+    /// Normally, if an event doesn't match any defined route, it is sent to the `<transform_name>._unmatched`
+    /// output for further processing. In some cases, you may want to simply discard unmatched events and not
+    /// process them any further.
+    ///
+    /// In these cases, `reroute_unmatched` can be set to `false` to disable the `<transform_name>._unmatched`
+    /// output and instead silently discard any unmatched events.
+    #[serde(default = "crate::serde::default_true")]
+    #[configurable(metadata(docs::human_name = "Reroute Unmatched Events"))]
+    reroute_unmatched: bool,
+
+    /// A map from route identifiers to logical conditions.
+    /// Each condition represents a filter which is applied to each event.
+    ///
+    /// The following identifiers are reserved output names and thus cannot be used as route IDs:
+    /// - `_unmatched`
+    /// - `_default`
+    ///
+    /// Each route can then be referenced as an input by other components with the name
+    /// `<transform_name>.<route_id>`. If an event doesn’t match any route, and if `reroute_unmatched`
+    /// is set to `true` (the default), it is sent to the `<transform_name>._unmatched` output.
+    /// Otherwise, the unmatched event is instead silently discarded.
+    #[configurable(metadata(docs::additional_props_description = "An individual route."))]
+    #[configurable(metadata(docs::examples = "route_examples()"))]
     route: IndexMap<String, AnyCondition>,
 }
 
-inventory::submit! {
-    TransformDescription::new::<RouteConfig>("swimlanes")
-}
-
-inventory::submit! {
-    TransformDescription::new::<RouteConfig>("route")
+fn route_examples() -> IndexMap<String, AnyCondition> {
+    IndexMap::from([
+        (
+            "foo-exists".to_owned(),
+            AnyCondition::Map(ConditionConfig::Vrl(VrlConfig {
+                source: "exists(.foo)".to_owned(),
+                ..Default::default()
+            })),
+        ),
+        (
+            "foo-does-not-exist".to_owned(),
+            AnyCondition::Map(ConditionConfig::Vrl(VrlConfig {
+                source: "!exists(.foo)".to_owned(),
+                ..Default::default()
+            })),
+        ),
+    ])
 }
 
 impl GenerateConfig for RouteConfig {
     fn generate_config() -> toml::Value {
         toml::Value::try_from(Self {
-            route: IndexMap::new(),
+            reroute_unmatched: true,
+            route: route_examples(),
         })
         .unwrap()
     }
@@ -94,79 +121,71 @@ impl GenerateConfig for RouteConfig {
 #[async_trait::async_trait]
 #[typetag::serde(name = "route")]
 impl TransformConfig for RouteConfig {
-    async fn build(&self, _context: &TransformContext) -> crate::Result<Transform> {
-        Err("this transform must be expanded".into())
-    }
-
-    fn expand(
-        &mut self,
-    ) -> crate::Result<Option<(IndexMap<String, Box<dyn TransformConfig>>, ExpandType)>> {
-        let mut map: IndexMap<String, Box<dyn TransformConfig>> = IndexMap::new();
-
-        while let Some((k, v)) = self.route.pop() {
-            if map
-                .insert(k.clone(), Box::new(LaneConfig { condition: v }))
-                .is_some()
-            {
-                return Err("duplicate route id".into());
-            }
-        }
-
-        if !map.is_empty() {
-            Ok(Some((map, ExpandType::Parallel)))
-        } else {
-            Err("must specify at least one lane".into())
-        }
-    }
-
-    fn input_type(&self) -> DataType {
-        DataType::Any
-    }
-
-    fn output_type(&self) -> DataType {
-        DataType::Any
-    }
-
-    fn transform_type(&self) -> &'static str {
-        "route"
-    }
-}
-
-// Add a compatibility alias to avoid breaking existing configs
-#[derive(Deserialize, Serialize, Debug, Clone)]
-struct RouteCompatConfig(RouteConfig);
-
-#[async_trait::async_trait]
-#[typetag::serde(name = "swimlanes")]
-impl TransformConfig for RouteCompatConfig {
     async fn build(&self, context: &TransformContext) -> crate::Result<Transform> {
-        self.0.build(context).await
+        let route = Route::new(self, context)?;
+        Ok(Transform::synchronous(route))
     }
 
-    fn expand(
-        &mut self,
-    ) -> crate::Result<Option<(IndexMap<String, Box<dyn TransformConfig>>, ExpandType)>> {
-        self.0.expand()
+    fn input(&self) -> Input {
+        Input::all()
     }
 
-    fn input_type(&self) -> DataType {
-        self.0.input_type()
+    fn validate(&self, _: &schema::Definition) -> Result<(), Vec<String>> {
+        if self.route.contains_key(UNMATCHED_ROUTE) {
+            Err(vec![format!(
+                "cannot have a named output with reserved name: `{UNMATCHED_ROUTE}`"
+            )])
+        } else {
+            Ok(())
+        }
     }
 
-    fn output_type(&self) -> DataType {
-        self.0.output_type()
+    fn outputs(
+        &self,
+        _: vector_lib::enrichment::TableRegistry,
+        input_definitions: &[(OutputId, schema::Definition)],
+        _: LogNamespace,
+    ) -> Vec<TransformOutput> {
+        let mut result: Vec<TransformOutput> = self
+            .route
+            .keys()
+            .map(|output_name| {
+                TransformOutput::new(
+                    DataType::all_bits(),
+                    clone_input_definitions(input_definitions),
+                )
+                .with_port(output_name)
+            })
+            .collect();
+        if self.reroute_unmatched {
+            result.push(
+                TransformOutput::new(
+                    DataType::all_bits(),
+                    clone_input_definitions(input_definitions),
+                )
+                .with_port(UNMATCHED_ROUTE),
+            );
+        }
+        result
     }
 
-    fn transform_type(&self) -> &'static str {
-        self.0.transform_type()
+    fn enable_concurrency(&self) -> bool {
+        true
     }
 }
-
-//------------------------------------------------------------------------------
 
 #[cfg(test)]
 mod test {
+    use std::collections::HashMap;
+
+    use indoc::indoc;
+    use vector_lib::transform::TransformOutputsBuf;
+
     use super::*;
+    use crate::{
+        config::{build_unit_tests, ConfigBuilder},
+        test_util::components::{init_test, COMPONENT_MULTIPLE_OUTPUTS_TESTS},
+    };
 
     #[test]
     fn generate_config() {
@@ -174,48 +193,227 @@ mod test {
     }
 
     #[test]
-    fn alias_works() {
-        toml::from_str::<RouteConfig>(
-            r#"
-            lanes.first.type = "check_fields"
-            lanes.first."message.eq" = "foo"
-        "#,
-        )
-        .unwrap();
-    }
-
-    #[test]
     fn can_serialize_remap() {
-        // We need to serialize the config to check if a config has
-        // changed when reloading.
-        let config = LaneConfig {
-            condition: AnyCondition::String("foo".to_string()),
-        };
-
-        assert_eq!(
-            serde_json::to_string(&config).unwrap(),
-            r#"{"condition":"foo"}"#
-        );
-    }
-
-    #[test]
-    fn can_serialize_check_fields() {
         // We need to serialize the config to check if a config has
         // changed when reloading.
         let config = toml::from_str::<RouteConfig>(
             r#"
-            lanes.first.type = "check_fields"
-            lanes.first."message.eq" = "foo"
+            route.first.type = "vrl"
+            route.first.source = '.message == "hello world"'
         "#,
         )
-        .unwrap()
-        .expand()
-        .unwrap()
         .unwrap();
 
         assert_eq!(
             serde_json::to_string(&config).unwrap(),
-            r#"[{"first":{"type":"lane","condition":{"type":"check_fields","message.eq":"foo"}}},"Parallel"]"#
+            r#"{"reroute_unmatched":true,"route":{"first":{"type":"vrl","source":".message == \"hello world\""}}}"#
         );
+    }
+
+    #[test]
+    fn route_pass_all_route_conditions() {
+        let output_names = vec!["first", "second", "third", UNMATCHED_ROUTE];
+        let event = Event::from_json_value(
+            serde_json::json!({"message": "hello world", "second": "second", "third": "third"}),
+            LogNamespace::Legacy,
+        )
+        .unwrap();
+        let config = toml::from_str::<RouteConfig>(
+            r#"
+            route.first.type = "vrl"
+            route.first.source = '.message == "hello world"'
+
+            route.second.type = "vrl"
+            route.second.source = '.second == "second"'
+
+            route.third.type = "vrl"
+            route.third.source = '.third == "third"'
+        "#,
+        )
+        .unwrap();
+
+        let mut transform = Route::new(&config, &Default::default()).unwrap();
+        let mut outputs = TransformOutputsBuf::new_with_capacity(
+            output_names
+                .iter()
+                .map(|output_name| {
+                    TransformOutput::new(DataType::all_bits(), HashMap::new())
+                        .with_port(output_name.to_owned())
+                })
+                .collect(),
+            1,
+        );
+
+        transform.transform(event.clone(), &mut outputs);
+        for output_name in output_names {
+            let mut events: Vec<_> = outputs.drain_named(output_name).collect();
+            if output_name == UNMATCHED_ROUTE {
+                assert!(events.is_empty());
+            } else {
+                assert_eq!(events.len(), 1);
+                assert_eq!(events.pop().unwrap(), event);
+            }
+        }
+    }
+
+    #[test]
+    fn route_pass_one_route_condition() {
+        let output_names = vec!["first", "second", "third", UNMATCHED_ROUTE];
+        let event = Event::from_json_value(
+            serde_json::json!({"message": "hello world"}),
+            LogNamespace::Legacy,
+        )
+        .unwrap();
+        let config = toml::from_str::<RouteConfig>(
+            r#"
+            route.first.type = "vrl"
+            route.first.source = '.message == "hello world"'
+
+            route.second.type = "vrl"
+            route.second.source = '.second == "second"'
+
+            route.third.type = "vrl"
+            route.third.source = '.third == "third"'
+        "#,
+        )
+        .unwrap();
+
+        let mut transform = Route::new(&config, &Default::default()).unwrap();
+        let mut outputs = TransformOutputsBuf::new_with_capacity(
+            output_names
+                .iter()
+                .map(|output_name| {
+                    TransformOutput::new(DataType::all_bits(), HashMap::new())
+                        .with_port(output_name.to_owned())
+                })
+                .collect(),
+            1,
+        );
+
+        transform.transform(event.clone(), &mut outputs);
+        for output_name in output_names {
+            let mut events: Vec<_> = outputs.drain_named(output_name).collect();
+            if output_name == "first" {
+                assert_eq!(events.len(), 1);
+                assert_eq!(events.pop().unwrap(), event);
+            }
+            assert_eq!(events.len(), 0);
+        }
+    }
+
+    #[test]
+    fn route_pass_no_route_condition() {
+        let output_names = vec!["first", "second", "third", UNMATCHED_ROUTE];
+        let event =
+            Event::from_json_value(serde_json::json!({"message": "NOPE"}), LogNamespace::Legacy)
+                .unwrap();
+        let config = toml::from_str::<RouteConfig>(
+            r#"
+            route.first.type = "vrl"
+            route.first.source = '.message == "hello world"'
+
+            route.second.type = "vrl"
+            route.second.source = '.second == "second"'
+
+            route.third.type = "vrl"
+            route.third.source = '.third == "third"'
+        "#,
+        )
+        .unwrap();
+
+        let mut transform = Route::new(&config, &Default::default()).unwrap();
+        let mut outputs = TransformOutputsBuf::new_with_capacity(
+            output_names
+                .iter()
+                .map(|output_name| {
+                    TransformOutput::new(DataType::all_bits(), HashMap::new())
+                        .with_port(output_name.to_owned())
+                })
+                .collect(),
+            1,
+        );
+
+        transform.transform(event.clone(), &mut outputs);
+        for output_name in output_names {
+            let mut events: Vec<_> = outputs.drain_named(output_name).collect();
+            if output_name == UNMATCHED_ROUTE {
+                assert_eq!(events.len(), 1);
+                assert_eq!(events.pop().unwrap(), event);
+            }
+            assert_eq!(events.len(), 0);
+        }
+    }
+
+    #[test]
+    fn route_no_unmatched_output() {
+        let output_names = vec!["first", "second", "third", UNMATCHED_ROUTE];
+        let event =
+            Event::from_json_value(serde_json::json!({"message": "NOPE"}), LogNamespace::Legacy)
+                .unwrap();
+        let config = toml::from_str::<RouteConfig>(
+            r#"
+            reroute_unmatched = false
+
+            route.first.type = "vrl"
+            route.first.source = '.message == "hello world"'
+
+            route.second.type = "vrl"
+            route.second.source = '.second == "second"'
+
+            route.third.type = "vrl"
+            route.third.source = '.third == "third"'
+        "#,
+        )
+        .unwrap();
+
+        let mut transform = Route::new(&config, &Default::default()).unwrap();
+        let mut outputs = TransformOutputsBuf::new_with_capacity(
+            output_names
+                .iter()
+                .map(|output_name| {
+                    TransformOutput::new(DataType::all_bits(), HashMap::new())
+                        .with_port(output_name.to_owned())
+                })
+                .collect(),
+            1,
+        );
+
+        transform.transform(event.clone(), &mut outputs);
+        for output_name in output_names {
+            let events: Vec<_> = outputs.drain_named(output_name).collect();
+            assert_eq!(events.len(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn route_metrics_with_output_tag() {
+        init_test();
+
+        let config: ConfigBuilder = toml::from_str(indoc! {r#"
+            [transforms.foo]
+            inputs = []
+            type = "route"
+            [transforms.foo.route.first]
+                type = "is_log"
+
+            [[tests]]
+            name = "metric output"
+
+            [tests.input]
+                insert_at = "foo"
+                value = "none"
+
+            [[tests.outputs]]
+                extract_from = "foo.first"
+                [[tests.outputs.conditions]]
+                type = "vrl"
+                source = "true"
+        "#})
+        .unwrap();
+
+        let mut tests = build_unit_tests(config).await.unwrap();
+        assert!(tests.remove(0).run().await.errors.is_empty());
+        // Check that metrics were emitted with output tag
+        COMPONENT_MULTIPLE_OUTPUTS_TESTS.assert(&["output"]);
     }
 }

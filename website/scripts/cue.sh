@@ -10,18 +10,13 @@ set -euo pipefail
 ROOT=$(git rev-parse --show-toplevel)
 CUE_SOURCES="${ROOT}/website/cue"
 JSON_OUT="${ROOT}/website/data/docs.json"
-CHECK_DOCS_SCRIPT="${ROOT}/scripts/check-docs.sh"
 
 list-docs-files() {
   find "${CUE_SOURCES}" -name '*.cue'
 }
 
 cmd_check() {
-  ${CHECK_DOCS_SCRIPT}
-}
-
-cmd_fmt() {
-  list-docs-files | xargs cue fmt "$@"
+  cargo vdev check docs
 }
 
 cmd_list() {

@@ -1,45 +1,62 @@
 pub mod adaptive_concurrency;
+pub mod auth;
+// https://github.com/mcarton/rust-derivative/issues/112
+#[allow(clippy::non_canonical_clone_impl)]
 pub mod batch;
 pub mod buffer;
 pub mod builder;
 pub mod compressor;
+pub mod datagram;
 pub mod encoding;
 pub mod http;
+pub mod metadata;
+pub mod normalizer;
+pub mod partitioner;
+pub mod processed_event;
 pub mod request_builder;
 pub mod retries;
 pub mod service;
 pub mod sink;
+pub mod snappy;
 pub mod socket_bytes_sink;
 pub mod statistic;
 pub mod tcp;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
 pub mod test;
 pub mod udp;
-#[cfg(all(any(feature = "sinks-socket", feature = "sinks-statsd"), unix))]
+#[cfg(unix)]
 pub mod unix;
 pub mod uri;
+pub mod zstd;
 
-use crate::event::{Event, EventFinalizers};
-use bytes::Bytes;
-use encoding::{EncodingConfig, EncodingConfiguration};
-use serde::{Deserialize, Serialize};
-use snafu::Snafu;
 use std::borrow::Cow;
 
-pub use batch::{Batch, BatchConfig, BatchSettings, BatchSize, PushResult};
-pub use buffer::json::{BoxedRawValue, JsonArrayBuffer};
-pub use buffer::partition::Partition;
-pub use buffer::vec::{EncodedLength, VecBuffer};
-pub use buffer::{Buffer, Compression, PartitionBuffer, PartitionInnerBuffer};
+pub use batch::{
+    Batch, BatchConfig, BatchSettings, BatchSize, BulkSizeBasedDefaultBatchSettings, Merged,
+    NoDefaultsBatchSettings, PushResult, RealtimeEventBasedDefaultBatchSettings,
+    RealtimeSizeBasedDefaultBatchSettings, SinkBatchSettings, Unmerged,
+};
+pub use buffer::{
+    json::{BoxedRawValue, JsonArrayBuffer},
+    partition::Partition,
+    vec::{EncodedLength, VecBuffer},
+    Buffer, Compression, PartitionBuffer, PartitionInnerBuffer,
+};
 pub use builder::SinkBuilderExt;
 pub use compressor::Compressor;
-pub use request_builder::RequestBuilder;
+pub use normalizer::Normalizer;
+pub use request_builder::{IncrementalRequestBuilder, RequestBuilder};
 pub use service::{
     Concurrency, ServiceBuilderExt, TowerBatchedSink, TowerPartitionSink, TowerRequestConfig,
     TowerRequestLayer, TowerRequestSettings,
 };
 pub use sink::{BatchSink, PartitionBatchSink, StreamSink};
+use snafu::Snafu;
 pub use uri::UriSerde;
+use vector_lib::{json_size::JsonSize, TimeZone};
+
+use crate::event::EventFinalizers;
+use chrono::{FixedOffset, Offset, Utc};
 
 #[derive(Debug, Snafu)]
 enum SinkBuildError {
@@ -54,16 +71,18 @@ pub struct EncodedEvent<I> {
     pub item: I,
     pub finalizers: EventFinalizers,
     pub byte_size: usize,
+    pub json_byte_size: JsonSize,
 }
 
 impl<I> EncodedEvent<I> {
     /// Create a trivial input with no metadata. This method will be
     /// removed when all sinks are converted.
-    pub fn new(item: I, byte_size: usize) -> Self {
+    pub fn new(item: I, byte_size: usize, json_byte_size: JsonSize) -> Self {
         Self {
             item,
             finalizers: Default::default(),
             byte_size,
+            json_byte_size,
         }
     }
 
@@ -80,6 +99,7 @@ impl<I> EncodedEvent<I> {
             item: I::from(that.item),
             finalizers: that.finalizers,
             byte_size: that.byte_size,
+            json_byte_size: that.json_byte_size,
         }
     }
 
@@ -89,46 +109,9 @@ impl<I> EncodedEvent<I> {
             item: doit(self.item),
             finalizers: self.finalizers,
             byte_size: self.byte_size,
+            json_byte_size: self.json_byte_size,
         }
     }
-}
-
-/**
- * Enum representing different ways to encode events as they are sent into a Sink.
- */
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Encoding {
-    Text,
-    Json,
-}
-
-/**
-* Encodes the given event into raw bytes that can be sent into a Sink, according to
-* the given encoding. If there are any errors encoding the event, logs a warning
-* and returns None.
-**/
-pub fn encode_log(mut event: Event, encoding: &EncodingConfig<Encoding>) -> Option<Bytes> {
-    encoding.apply_rules(&mut event);
-    let log = event.into_log();
-
-    let b = match encoding.codec() {
-        Encoding::Json => serde_json::to_vec(&log),
-        Encoding::Text => {
-            let bytes = log
-                .get(crate::config::log_schema().message_key())
-                .map(|v| v.as_bytes().to_vec())
-                .unwrap_or_default();
-            Ok(bytes)
-        }
-    };
-
-    b.map(|mut b| {
-        b.push(b'\n');
-        Bytes::from(b)
-    })
-    .map_err(|error| error!(message = "Unable to encode.", %error))
-    .ok()
 }
 
 /// Joins namespace with name via delimiter if namespace is present.
@@ -154,8 +137,9 @@ impl<T> ElementCount for Vec<T> {
     }
 }
 
-impl ElementCount for serde_json::Value {
-    fn element_count(&self) -> usize {
-        1
+pub fn timezone_to_offset(tz: TimeZone) -> Option<FixedOffset> {
+    match tz {
+        TimeZone::Local => Some(*Utc::now().with_timezone(&chrono::Local).offset()),
+        TimeZone::Named(tz) => Some(Utc::now().with_timezone(&tz).offset().fix()),
     }
 }

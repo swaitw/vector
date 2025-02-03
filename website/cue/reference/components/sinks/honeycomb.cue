@@ -6,23 +6,29 @@ components: sinks: honeycomb: {
 	classes: {
 		commonly_used: false
 		delivery:      "at_least_once"
-		development:   "beta"
+		development:   "stable"
 		egress_method: "batch"
 		service_providers: ["Honeycomb"]
 		stateful: false
 	}
 
 	features: {
-		buffer: enabled:      true
+		acknowledgements: true
+		auto_generated:   true
 		healthcheck: enabled: true
 		send: {
 			batch: {
 				enabled:      true
 				common:       false
-				max_bytes:    5242880
-				timeout_secs: 1
+				max_bytes:    100_000
+				timeout_secs: 1.0
 			}
-			compression: enabled: false
+			compression: {
+				enabled: true
+				default: "gzip"
+				algorithms: ["none", "gzip", "zstd"]
+				levels: ["none", "fast", "default", "best", 0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+			}
 			encoding: {
 				enabled: true
 				codec: enabled: false
@@ -52,45 +58,17 @@ components: sinks: honeycomb: {
 	}
 
 	support: {
-		targets: {
-			"aarch64-unknown-linux-gnu":      true
-			"aarch64-unknown-linux-musl":     true
-			"armv7-unknown-linux-gnueabihf":  true
-			"armv7-unknown-linux-musleabihf": true
-			"x86_64-apple-darwin":            true
-			"x86_64-pc-windows-msv":          true
-			"x86_64-unknown-linux-gnu":       true
-			"x86_64-unknown-linux-musl":      true
-		}
 		requirements: []
 		warnings: []
 		notices: []
 	}
 
-	configuration: {
-		api_key: {
-			description: "The team key that will be used to authenticate against Honeycomb."
-			required:    true
-			warnings: []
-			type: string: {
-				examples: ["${HONEYCOMB_API_KEY}", "some-api-key"]
-				syntax: "literal"
-			}
-		}
-		dataset: {
-			description: "The dataset that Vector will send logs to."
-			required:    true
-			warnings: []
-			type: string: {
-				examples: ["my-honeycomb-dataset"]
-				syntax: "literal"
-			}
-		}
-	}
+	configuration: base.components.sinks.honeycomb.configuration
 
 	input: {
 		logs:    true
 		metrics: null
+		traces:  false
 	}
 
 	how_it_works: {
@@ -103,12 +81,5 @@ components: sinks: honeycomb: {
 				curl option and use the key provided with the curl example.
 				"""
 		}
-	}
-
-	telemetry: metrics: {
-		component_sent_bytes_total:       components.sources.internal_metrics.output.metrics.component_sent_bytes_total
-		component_sent_events_total:      components.sources.internal_metrics.output.metrics.component_sent_events_total
-		component_sent_event_bytes_total: components.sources.internal_metrics.output.metrics.component_sent_event_bytes_total
-		events_out_total:                 components.sources.internal_metrics.output.metrics.events_out_total
 	}
 }

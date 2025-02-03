@@ -1,52 +1,82 @@
+use std::{path::Path, time::Duration};
+
+use indexmap::IndexMap;
+use vector_lib::config::GlobalOptions;
+use vector_lib::configurable::configurable_component;
+
+use crate::{enrichment_tables::EnrichmentTables, providers::Providers, secrets::SecretBackends};
+
 #[cfg(feature = "api")]
 use super::api;
-#[cfg(feature = "datadog-pipelines")]
-use super::datadog;
 use super::{
-    compiler, provider, ComponentKey, Config, EnrichmentTableConfig, EnrichmentTableOuter,
-    HealthcheckOptions, SinkConfig, SinkOuter, SourceConfig, SourceOuter, TestDefinition,
+    compiler, schema, BoxedSink, BoxedSource, BoxedTransform, ComponentKey, Config,
+    EnrichmentTableOuter, HealthcheckOptions, SinkOuter, SourceOuter, TestDefinition,
     TransformOuter,
 };
-use indexmap::IndexMap;
-use serde::{Deserialize, Serialize};
-use vector_core::{config::GlobalOptions, default_data_dir, transform::TransformConfig};
 
-#[derive(Deserialize, Serialize, Debug, Default)]
+/// A complete Vector configuration.
+#[configurable_component]
+#[derive(Clone, Debug, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ConfigBuilder {
     #[serde(flatten)]
     pub global: GlobalOptions,
+
     #[cfg(feature = "api")]
+    #[configurable(derived)]
     #[serde(default)]
     pub api: api::Options,
-    #[cfg(feature = "datadog-pipelines")]
+
+    #[configurable(derived)]
+    #[configurable(metadata(docs::hidden))]
     #[serde(default)]
-    pub datadog: datadog::Options,
+    pub schema: schema::Options,
+
+    #[configurable(derived)]
     #[serde(default)]
     pub healthchecks: HealthcheckOptions,
+
+    /// All configured enrichment tables.
     #[serde(default)]
-    pub enrichment_tables: IndexMap<ComponentKey, EnrichmentTableOuter>,
+    pub enrichment_tables: IndexMap<ComponentKey, EnrichmentTableOuter<String>>,
+
+    /// All configured sources.
     #[serde(default)]
     pub sources: IndexMap<ComponentKey, SourceOuter>,
+
+    /// All configured sinks.
     #[serde(default)]
     pub sinks: IndexMap<ComponentKey, SinkOuter<String>>,
+
+    /// All configured transforms.
     #[serde(default)]
     pub transforms: IndexMap<ComponentKey, TransformOuter<String>>,
-    #[serde(default)]
-    pub tests: Vec<TestDefinition>,
-    pub provider: Option<Box<dyn provider::ProviderConfig>>,
-}
 
-impl Clone for ConfigBuilder {
-    fn clone(&self) -> Self {
-        // This is a hack around the issue of cloning
-        // trait objects. So instead to clone the config
-        // we first serialize it into JSON, then back from
-        // JSON. Originally we used TOML here but TOML does not
-        // support serializing `None`.
-        let json = serde_json::to_value(self).unwrap();
-        serde_json::from_value(json).unwrap()
-    }
+    /// All configured unit tests.
+    #[serde(default)]
+    pub tests: Vec<TestDefinition<String>>,
+
+    /// Optional configuration provider to use.
+    ///
+    /// Configuration providers allow sourcing configuration information from a source other than
+    /// the typical configuration files that must be passed to Vector.
+    pub provider: Option<Providers>,
+
+    /// All configured secrets backends.
+    #[serde(default)]
+    pub secret: IndexMap<ComponentKey, SecretBackends>,
+
+    /// The duration in seconds to wait for graceful shutdown after SIGINT or SIGTERM are received.
+    /// After the duration has passed, Vector will force shutdown. Default value is 60 seconds. This
+    /// value can be set using a [cli arg](crate::cli::RootOpts::graceful_shutdown_limit_secs).
+    #[serde(default, skip)]
+    #[doc(hidden)]
+    pub graceful_shutdown_duration: Option<Duration>,
+
+    /// Allow the configuration to be empty, resulting in a topology with no components.
+    #[serde(default, skip)]
+    #[doc(hidden)]
+    pub allow_empty: bool,
 }
 
 impl From<Config> for ConfigBuilder {
@@ -55,15 +85,15 @@ impl From<Config> for ConfigBuilder {
             global,
             #[cfg(feature = "api")]
             api,
-            #[cfg(feature = "datadog-pipelines")]
-            datadog,
+            schema,
             healthchecks,
             enrichment_tables,
             sources,
             sinks,
             transforms,
             tests,
-            expansions: _,
+            secret,
+            graceful_shutdown_duration,
         } = config;
 
         let transforms = transforms
@@ -76,12 +106,18 @@ impl From<Config> for ConfigBuilder {
             .map(|(key, sink)| (key, sink.map_inputs(ToString::to_string)))
             .collect();
 
+        let enrichment_tables = enrichment_tables
+            .into_iter()
+            .map(|(key, table)| (key, table.map_inputs(ToString::to_string)))
+            .collect();
+
+        let tests = tests.into_iter().map(TestDefinition::stringify).collect();
+
         ConfigBuilder {
             global,
             #[cfg(feature = "api")]
             api,
-            #[cfg(feature = "datadog-pipelines")]
-            datadog,
+            schema,
             healthchecks,
             enrichment_tables,
             sources,
@@ -89,6 +125,9 @@ impl From<Config> for ConfigBuilder {
             transforms,
             provider: None,
             tests,
+            secret,
+            graceful_shutdown_duration,
+            allow_empty: false,
         }
     }
 }
@@ -108,25 +147,30 @@ impl ConfigBuilder {
         compiler::compile(self)
     }
 
-    pub fn add_enrichment_table<E: EnrichmentTableConfig + 'static, T: Into<String>>(
+    pub fn add_enrichment_table<K: Into<String>, E: Into<EnrichmentTables>>(
         &mut self,
-        name: T,
+        key: K,
+        inputs: &[&str],
         enrichment_table: E,
     ) {
+        let inputs = inputs
+            .iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>();
         self.enrichment_tables.insert(
-            ComponentKey::from(name.into()),
-            EnrichmentTableOuter::new(Box::new(enrichment_table)),
+            ComponentKey::from(key.into()),
+            EnrichmentTableOuter::new(inputs, enrichment_table),
         );
     }
 
-    pub fn add_source<S: SourceConfig + 'static, T: Into<String>>(&mut self, id: T, source: S) {
+    pub fn add_source<K: Into<String>, S: Into<BoxedSource>>(&mut self, key: K, source: S) {
         self.sources
-            .insert(ComponentKey::from(id.into()), SourceOuter::new(source));
+            .insert(ComponentKey::from(key.into()), SourceOuter::new(source));
     }
 
-    pub fn add_sink<S: SinkConfig + 'static, T: Into<String>>(
+    pub fn add_sink<K: Into<String>, S: Into<BoxedSink>>(
         &mut self,
-        id: T,
+        key: K,
         inputs: &[&str],
         sink: S,
     ) {
@@ -134,28 +178,34 @@ impl ConfigBuilder {
             .iter()
             .map(|value| value.to_string())
             .collect::<Vec<_>>();
-        let sink = SinkOuter::new(inputs, Box::new(sink));
-
-        self.sinks.insert(ComponentKey::from(id.into()), sink);
+        let sink = SinkOuter::new(inputs, sink);
+        self.add_sink_outer(key, sink);
     }
 
-    pub fn add_transform<T: TransformConfig + 'static, S: Into<String>>(
+    pub fn add_sink_outer<K: Into<String>>(&mut self, key: K, sink: SinkOuter<String>) {
+        self.sinks.insert(ComponentKey::from(key.into()), sink);
+    }
+
+    // For some feature sets, no transforms are compiled, which leads to no callers using this
+    // method, and in turn, annoying errors about unused variables.
+    pub fn add_transform(
         &mut self,
-        id: S,
+        key: impl Into<String>,
         inputs: &[&str],
-        transform: T,
+        transform: impl Into<BoxedTransform>,
     ) {
         let inputs = inputs
             .iter()
             .map(|value| value.to_string())
             .collect::<Vec<_>>();
-        let transform = TransformOuter {
-            inner: Box::new(transform),
-            inputs,
-        };
+        let transform = TransformOuter::new(inputs, transform);
 
         self.transforms
-            .insert(ComponentKey::from(id.into()), transform);
+            .insert(ComponentKey::from(key.into()), transform);
+    }
+
+    pub fn set_data_dir(&mut self, path: &Path) {
+        self.global.data_dir = Some(path.to_owned());
     }
 
     pub fn append(&mut self, with: Self) -> Result<(), Vec<String>> {
@@ -166,46 +216,16 @@ impl ConfigBuilder {
             errors.push(error);
         }
 
-        #[cfg(feature = "datadog-pipelines")]
-        {
-            self.datadog = with.datadog;
-            if self.datadog.enabled {
-                // enable other enterprise features
-                self.global.enterprise = true;
-            }
-        }
-
         self.provider = with.provider;
 
-        if self.global.proxy.http.is_some() && with.global.proxy.http.is_some() {
-            errors.push("conflicting values for 'proxy.http' found".to_owned());
+        match self.global.merge(with.global) {
+            Err(errs) => errors.extend(errs),
+            Ok(new_global) => self.global = new_global,
         }
 
-        if self.global.proxy.https.is_some() && with.global.proxy.https.is_some() {
-            errors.push("conflicting values for 'proxy.https' found".to_owned());
-        }
+        self.schema.append(with.schema, &mut errors);
 
-        if !self.global.proxy.no_proxy.is_empty() && !with.global.proxy.no_proxy.is_empty() {
-            errors.push("conflicting values for 'proxy.no_proxy' found".to_owned());
-        }
-
-        self.global.proxy = self.global.proxy.merge(&with.global.proxy);
-
-        if self.global.data_dir.is_none() || self.global.data_dir == default_data_dir() {
-            self.global.data_dir = with.global.data_dir;
-        } else if with.global.data_dir != default_data_dir()
-            && self.global.data_dir != with.global.data_dir
-        {
-            // If two configs both set 'data_dir' and have conflicting values
-            // we consider this an error.
-            errors.push("conflicting values for 'data_dir' found".to_owned());
-        }
-
-        // If the user has multiple config files, we must *merge* log schemas
-        // until we meet a conflict, then we are allowed to error.
-        if let Err(merge_errors) = self.global.log_schema.merge(&with.global.log_schema) {
-            errors.extend(merge_errors);
-        }
+        self.schema.log_namespace = self.schema.log_namespace.or(with.schema.log_namespace);
 
         self.healthchecks.merge(with.healthchecks);
 
@@ -234,6 +254,11 @@ impl ConfigBuilder {
                 errors.push(format!("duplicate test name found: {}", wt.name));
             }
         });
+        with.secret.keys().for_each(|k| {
+            if self.secret.contains_key(k) {
+                errors.push(format!("duplicate secret id found: {}", k));
+            }
+        });
         if !errors.is_empty() {
             return Err(errors);
         }
@@ -243,19 +268,18 @@ impl ConfigBuilder {
         self.sinks.extend(with.sinks);
         self.transforms.extend(with.transforms);
         self.tests.extend(with.tests);
+        self.secret.extend(with.secret);
 
         Ok(())
     }
 
     #[cfg(test)]
     pub fn from_toml(input: &str) -> Self {
-        crate::config::format::deserialize(input, Some(crate::config::format::Format::Toml))
-            .unwrap()
+        crate::config::format::deserialize(input, crate::config::format::Format::Toml).unwrap()
     }
 
     #[cfg(test)]
     pub fn from_json(input: &str) -> Self {
-        crate::config::format::deserialize(input, Some(crate::config::format::Format::Json))
-            .unwrap()
+        crate::config::format::deserialize(input, crate::config::format::Format::Json).unwrap()
     }
 }

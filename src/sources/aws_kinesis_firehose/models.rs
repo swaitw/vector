@@ -1,15 +1,15 @@
-use chrono::serde::ts_milliseconds;
-use chrono::{DateTime, Utc};
+use chrono::{serde::ts_milliseconds, DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 /// Represents an AWS Kinesis Firehose request
 ///
 /// Represents protocol v1.0 (the only protocol as of writing)
 ///
-/// https://docs.aws.amazon.com/firehose/latest/dev/httpdeliveryrequestresponse.html
+/// <https://docs.aws.amazon.com/firehose/latest/dev/httpdeliveryrequestresponse.html>
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FirehoseRequest {
+    pub access_key: Option<String>,
     pub request_id: String,
 
     #[serde(with = "ts_milliseconds")]
@@ -28,7 +28,7 @@ pub struct EncodedFirehoseRecord {
 ///
 /// Represents protocol v1.0 (the only protocol as of writing)
 ///
-/// https://docs.aws.amazon.com/firehose/latest/dev/httpdeliveryrequestresponse.html
+/// <https://docs.aws.amazon.com/firehose/latest/dev/httpdeliveryrequestresponse.html>
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FirehoseResponse {

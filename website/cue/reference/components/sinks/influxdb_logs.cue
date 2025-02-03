@@ -13,14 +13,15 @@ components: sinks: influxdb_logs: {
 	}
 
 	features: {
-		buffer: enabled:      true
+		auto_generated:   true
+		acknowledgements: true
 		healthcheck: enabled: true
 		send: {
 			batch: {
 				enabled:      true
 				common:       false
-				max_bytes:    1049000
-				timeout_secs: 1
+				max_bytes:    1_000_000
+				timeout_secs: 1.0
 			}
 			compression: enabled: false
 			encoding: {
@@ -37,37 +38,17 @@ components: sinks: influxdb_logs: {
 	}
 
 	support: {
-		targets: {
-			"aarch64-unknown-linux-gnu":      true
-			"aarch64-unknown-linux-musl":     true
-			"armv7-unknown-linux-gnueabihf":  true
-			"armv7-unknown-linux-musleabihf": true
-			"x86_64-apple-darwin":            true
-			"x86_64-pc-windows-msv":          true
-			"x86_64-unknown-linux-gnu":       true
-			"x86_64-unknown-linux-musl":      true
-		}
 		requirements: []
 		warnings: []
 		notices: []
 	}
 
-	configuration: sinks._influxdb.configuration & {
-		namespace: {
-			description: "A prefix that will be added to all logs names."
-			groups: ["v1", "v2"]
-			required: true
-			warnings: []
-			type: string: {
-				examples: ["service"]
-				syntax: "literal"
-			}
-		}
-	}
+	configuration: base.components.sinks.influxdb_logs.configuration
 
 	input: {
 		logs:    true
 		metrics: null
+		traces:  false
 	}
 
 	how_it_works: {
@@ -80,7 +61,7 @@ components: sinks: influxdb_logs: {
 
 				The following matrix outlines how Log Event fields are mapped into InfluxDB Line Protocol:
 
-				| Field         | Line Protocol     |                                                                                                                                                 |
+				| Field         | Line Protocol     |
 				|---------------|-------------------|
 				| host          | tag               |
 				| message       | field             |
@@ -109,18 +90,11 @@ components: sinks: influxdb_logs: {
 						Will be mapped to Influx's line protocol:
 
 						```influxdb_line_protocol
-						ns.vector,host=my.host.com,metric_type=logs custom_field="custom_value",message="<13>Feb 13 20:07:26 74794bfb6795 root[8539]: i am foobar" 1572642947000000000
+						vector-logs,host=my.host.com,metric_type=logs custom_field="custom_value",message="<13>Feb 13 20:07:26 74794bfb6795 root[8539]: i am foobar" 1572642947000000000
 						```
 						"""
 				},
 			]
 		}
-	}
-
-	telemetry: metrics: {
-		component_sent_bytes_total:       components.sources.internal_metrics.output.metrics.component_sent_bytes_total
-		component_sent_events_total:      components.sources.internal_metrics.output.metrics.component_sent_events_total
-		component_sent_event_bytes_total: components.sources.internal_metrics.output.metrics.component_sent_event_bytes_total
-		events_out_total:                 components.sources.internal_metrics.output.metrics.events_out_total
 	}
 }

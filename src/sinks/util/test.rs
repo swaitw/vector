@@ -1,24 +1,40 @@
-use crate::{
-    config::{SinkConfig, SinkContext},
-    Error,
-};
-use bytes::Bytes;
-use futures::{channel::mpsc, FutureExt, SinkExt, TryFutureExt};
+use bytes::{Buf, Bytes};
+use flate2::read::{MultiGzDecoder, ZlibDecoder};
+use futures::{channel::mpsc, stream, FutureExt, SinkExt, TryFutureExt};
+use futures_util::StreamExt;
+use http::request::Parts;
 use hyper::{
     body::HttpBody,
     service::{make_service_fn, service_fn},
     Body, Request, Response, Server, StatusCode,
 };
 use serde::Deserialize;
-use std::net::SocketAddr;
+use std::{
+    io::{BufRead, BufReader},
+    net::SocketAddr,
+};
 use stream_cancel::{Trigger, Tripwire};
+
+use crate::{
+    config::{SinkConfig, SinkContext},
+    Error,
+};
 
 pub fn load_sink<T>(config: &str) -> crate::Result<(T, SinkContext)>
 where
     for<'a> T: Deserialize<'a> + SinkConfig,
 {
     let sink_config: T = toml::from_str(config)?;
-    let cx = SinkContext::new_test();
+    let cx = SinkContext::default();
+
+    Ok((sink_config, cx))
+}
+
+pub fn load_sink_with_context<T>(config: &str, cx: SinkContext) -> crate::Result<(T, SinkContext)>
+where
+    for<'a> T: Deserialize<'a> + SinkConfig,
+{
+    let sink_config: T = toml::from_str(config)?;
 
     Ok((sink_config, cx))
 }
@@ -58,7 +74,7 @@ pub fn build_test_server_generic<B>(
     impl std::future::Future<Output = Result<(), ()>>,
 )
 where
-    B: HttpBody + Send + Sync + 'static,
+    B: HttpBody + Send + 'static,
     <B as HttpBody>::Data: Send + Sync,
     <B as HttpBody>::Error: snafu::Error + Send + Sync,
 {
@@ -90,8 +106,45 @@ where
     let (trigger, tripwire) = Tripwire::new();
     let server = Server::bind(&addr)
         .serve(service)
-        .with_graceful_shutdown(tripwire.then(crate::stream::tripwire_handler))
+        .with_graceful_shutdown(tripwire.then(crate::shutdown::tripwire_handler))
         .map_err(|error| panic!("Server error: {}", error));
 
     (rx, trigger, server)
+}
+
+pub async fn get_received_gzip(
+    rx: mpsc::Receiver<(Parts, Bytes)>,
+    assert_parts: impl Fn(Parts),
+) -> Vec<String> {
+    get_received(rx, assert_parts, |body| MultiGzDecoder::new(body.reader())).await
+}
+
+pub async fn get_received_zlib(
+    rx: mpsc::Receiver<(Parts, Bytes)>,
+    assert_parts: impl Fn(Parts),
+) -> Vec<String> {
+    get_received(rx, assert_parts, |body| ZlibDecoder::new(body.reader())).await
+}
+
+async fn get_received<D>(
+    rx: mpsc::Receiver<(Parts, Bytes)>,
+    assert_parts: impl Fn(Parts),
+    decoder_maker: impl Fn(Bytes) -> D,
+) -> Vec<String>
+where
+    D: std::io::Read,
+{
+    rx.flat_map(|(parts, body)| {
+        assert_parts(parts);
+        let decoder = decoder_maker(body);
+        let reader = BufReader::new(decoder);
+        stream::iter(reader.lines())
+    })
+    .map(Result::unwrap)
+    .map(|line| {
+        let val: serde_json::Value = serde_json::from_str(&line).unwrap();
+        val.get("message").unwrap().as_str().unwrap().to_owned()
+    })
+    .collect::<Vec<_>>()
+    .await
 }

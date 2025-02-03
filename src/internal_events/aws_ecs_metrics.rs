@@ -1,95 +1,69 @@
-// ## skip check-events ##
-
-use metrics::{counter, histogram};
 use std::borrow::Cow;
-use std::time::Instant;
-use vector_core::internal_event::InternalEvent;
+
+use metrics::counter;
+use vector_lib::{
+    internal_event::{error_stage, error_type, InternalEvent},
+    json_size::JsonSize,
+};
 
 #[derive(Debug)]
-pub struct AwsEcsMetricsReceived {
-    pub byte_size: usize,
+pub struct AwsEcsMetricsEventsReceived<'a> {
+    pub byte_size: JsonSize,
     pub count: usize,
+    pub endpoint: &'a str,
 }
 
-impl InternalEvent for AwsEcsMetricsReceived {
-    fn emit_logs(&self) {
-        debug!(message = "Scraped events.", ?self.count);
-    }
-
-    fn emit_metrics(&self) {
-        counter!("component_received_events_total", self.count as u64);
-        counter!("events_in_total", self.count as u64);
-        counter!("processed_bytes_total", self.byte_size as u64);
-    }
-}
-
-#[derive(Debug)]
-pub struct AwsEcsMetricsRequestCompleted {
-    pub start: Instant,
-    pub end: Instant,
-}
-
-impl InternalEvent for AwsEcsMetricsRequestCompleted {
-    fn emit_logs(&self) {
-        debug!(message = "Request completed.");
-    }
-
-    fn emit_metrics(&self) {
-        counter!("requests_completed_total", 1);
-        histogram!("request_duration_seconds", self.end - self.start);
+impl InternalEvent for AwsEcsMetricsEventsReceived<'_> {
+    fn emit(self) {
+        trace!(
+            message = "Events received.",
+            count = %self.count,
+            byte_size = %self.byte_size,
+            protocol = "http",
+            endpoint = %self.endpoint,
+        );
+        counter!(
+            "component_received_events_total",
+            "endpoint" => self.endpoint.to_string(),
+        )
+        .increment(self.count as u64);
+        counter!(
+            "component_received_event_bytes_total",
+            "endpoint" => self.endpoint.to_string(),
+        )
+        .increment(self.byte_size.get() as u64);
     }
 }
 
 #[derive(Debug)]
 pub struct AwsEcsMetricsParseError<'a> {
     pub error: serde_json::Error,
-    pub url: &'a str,
+    pub endpoint: &'a str,
     pub body: Cow<'a, str>,
 }
 
-impl<'a> InternalEvent for AwsEcsMetricsParseError<'_> {
-    fn emit_logs(&self) {
-        error!(message = "Parsing error.", url = %self.url, error = %self.error);
+impl InternalEvent for AwsEcsMetricsParseError<'_> {
+    fn emit(self) {
+        error!(
+            message = "Parsing error.",
+            endpoint = %self.endpoint,
+            error = ?self.error,
+            stage = error_stage::PROCESSING,
+            error_type = error_type::PARSER_FAILED,
+            internal_log_rate_limit = true,
+        );
         debug!(
             message = %format!("Failed to parse response:\\n\\n{}\\n\\n", self.body.escape_debug()),
-            url = %self.url,
-            internal_log_rate_secs = 10
+            endpoint = %self.endpoint,
+            internal_log_rate_limit = true,
         );
-    }
-
-    fn emit_metrics(&self) {
-        counter!("parse_errors_total", 1);
-    }
-}
-
-#[derive(Debug)]
-pub struct AwsEcsMetricsErrorResponse<'a> {
-    pub code: hyper::StatusCode,
-    pub url: &'a str,
-}
-
-impl InternalEvent for AwsEcsMetricsErrorResponse<'_> {
-    fn emit_logs(&self) {
-        error!(message = "HTTP error response.", url = %self.url, code = %self.code);
-    }
-
-    fn emit_metrics(&self) {
-        counter!("http_error_response_total", 1);
-    }
-}
-
-#[derive(Debug)]
-pub struct AwsEcsMetricsHttpError<'a> {
-    pub error: hyper::Error,
-    pub url: &'a str,
-}
-
-impl InternalEvent for AwsEcsMetricsHttpError<'_> {
-    fn emit_logs(&self) {
-        error!(message = "HTTP request processing error.", url = %self.url, error = %self.error);
-    }
-
-    fn emit_metrics(&self) {
-        counter!("http_request_errors_total", 1);
+        counter!("parse_errors_total").increment(1);
+        counter!(
+            "component_errors_total",
+            "stage" => error_stage::PROCESSING,
+            "error_type" => error_type::PARSER_FAILED,
+            "endpoint" => self.endpoint.to_string(),
+        )
+        .increment(1);
     }
 }

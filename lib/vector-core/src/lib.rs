@@ -8,8 +8,14 @@
 //! This library was extracted from the top-level project package, discussed in
 //! RFC 7027.
 
+#![deny(warnings)]
 #![deny(clippy::all)]
 #![deny(clippy::pedantic)]
+#![deny(unreachable_pub)]
+#![deny(unused_allocation)]
+#![deny(unused_extern_crates)]
+#![deny(unused_assignments)]
+#![deny(unused_comparisons)]
 #![allow(clippy::cast_possible_wrap)]
 #![allow(clippy::cast_sign_loss)]
 #![allow(clippy::default_trait_access)] // triggers on generated prost code
@@ -21,31 +27,33 @@
 #![allow(clippy::unnested_or_patterns)] // nightly-only feature as of 1.51.0
 #![allow(clippy::type_complexity)] // long-types happen, especially in async code
 
-#[cfg(feature = "api")]
-pub mod api;
 pub mod config;
 pub mod event;
-pub mod mapping;
+pub mod fanout;
+pub mod ipallowlist;
 pub mod metrics;
+pub mod partition;
+pub mod schema;
+pub mod serde;
 pub mod sink;
 pub mod source;
+pub mod tcp;
 #[cfg(test)]
 mod test_util;
-pub mod transform;
-pub use buffers;
-pub mod partition;
-pub mod serde;
-pub mod stream;
 pub mod time;
-pub use core_common::byte_size_of::ByteSizeOf;
-pub use core_common::internal_event;
+pub mod tls;
+pub mod transform;
+#[cfg(feature = "vrl")]
+pub mod vrl;
 
+use float_eq::FloatEq;
 use std::path::PathBuf;
 
-#[macro_use]
-extern crate derivative;
-#[macro_use]
-extern crate pest_derive;
+#[cfg(feature = "vrl")]
+pub use crate::vrl::compile_vrl;
+
+pub use event::EstimatedJsonEncodedSizeOf;
+
 #[macro_use]
 extern crate tracing;
 
@@ -53,10 +61,48 @@ pub fn default_data_dir() -> Option<PathBuf> {
     Some(PathBuf::from("/var/lib/vector/"))
 }
 
-/// Vector's basic error type, dynamically dispatched and safe to send across
-/// threads.
-pub type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
+pub(crate) use vector_common::{Error, Result};
 
-/// Vector's basic result type, defined in terms of [`Error`] and generic over
-/// `T`.
-pub type Result<T> = std::result::Result<T, Error>;
+pub(crate) fn float_eq(l_value: f64, r_value: f64) -> bool {
+    (l_value.is_nan() && r_value.is_nan()) || l_value.eq_ulps(&r_value, &1)
+}
+
+// These macros aren't actually usable in lib crates without some `vector_lib` shenanigans.
+// This test version won't be needed once all `InternalEvent`s implement `name()`.
+#[cfg(feature = "test")]
+#[macro_export]
+macro_rules! emit {
+    ($event:expr) => {
+        vector_lib::internal_event::emit(vector_lib::internal_event::DefaultName {
+            event: $event,
+            name: stringify!($event),
+        })
+    };
+}
+
+#[cfg(not(feature = "test"))]
+#[macro_export]
+macro_rules! emit {
+    ($event:expr) => {
+        vector_lib::internal_event::emit($event)
+    };
+}
+
+#[cfg(feature = "test")]
+#[macro_export]
+macro_rules! register {
+    ($event:expr) => {
+        vector_lib::internal_event::register(vector_lib::internal_event::DefaultName {
+            event: $event,
+            name: stringify!($event),
+        })
+    };
+}
+
+#[cfg(not(feature = "test"))]
+#[macro_export]
+macro_rules! register {
+    ($event:expr) => {
+        vector_lib::internal_event::register($event)
+    };
+}

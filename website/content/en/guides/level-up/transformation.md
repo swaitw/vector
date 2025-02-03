@@ -38,8 +38,8 @@ choice for transforming data in Vector:
   ensure that your VRL code is sound, meaning no dead code, no unhandled errors,
   and no type mismatches.
 
-In cases where VRL doesn't fit your use case, Vector also offers two [runtime
-transforms](#runtime-transforms) that offer a bit more flexibility than VRL but
+In cases where VRL doesn't fit your use case, Vector also offers a [Lua runtime
+transform](#lua-runtime-transform) that offer a bit more flexibility than VRL but
 also come with downsides (listed below) that should always be borne in mind.
 
 ## Transforming data using VRL
@@ -47,7 +47,7 @@ also come with downsides (listed below) that should always be borne in mind.
 Let's jump straight into an example of using VRL to modify some data. We'll
 create a simple topology consisting of three components:
 
-1. A [`generator`][docs.sources.generator] source produces random [Syslog][urls.syslog]
+1. A [`demo_logs`][docs.sources.demo_logs] source produces random [Syslog][urls.syslog]
    messages at a rate of 10 per second.
 2. A [`remap`][docs.transforms.remap] transform uses VRL to parse incoming Syslog lines
    into named fields (`severity`, `timestamp`, etc.).
@@ -56,37 +56,44 @@ create a simple topology consisting of three components:
 
 This configuration defines that topology:
 
-```toml title="vector.toml"
-[sources.logs]
-  type = "generator"
-  format = "syslog"
-  interval = 0.1
+```yaml title="vector.yaml"
+sources:
+  logs:
+    type: demo_logs
+    format: syslog
+    interval: 0.1
 
-[transforms.modify]
-  type = "remap"
-  inputs = ["logs"]
-  source = '''
-    # Parse Syslog input. The "!" means that the script should abort on error.
-    . = parse_syslog!(.message)
-  '''
+transforms:
+  modify:
+    type: remap
+    inputs:
+      - logs
+    source: |
+      # Parse Syslog input. The "!" means that the script should abort on error.
+      . = parse_syslog!(.message)
 
-[sinks.out]
-  type = "console"
-  inputs = ["modify"]
-  encoding.codec = "json"
+sinks:
+  out:
+    type: console
+    inputs:
+      - modify
+    encoding:
+      codec: json
 ```
 
 {{< info >}}
-Although we're using [TOML][urls.toml] for the configuration here, Vector also
-supports JSON and YAML.
+Although we're using [YAML][urls.yaml] for the configuration here, Vector also
+supports [TOML][urls.toml] and [JSON][urls.json].
 
 [urls.toml]: https://github.com/toml-lang/toml
+[urls.yaml]: https://yaml.org
+[urls.json]: https://www.json.org/json-en.html
 {{< /info >}}
 
 To start Vector using this topology:
 
 ```bash
-vector --config-toml /etc/vector/vector.toml
+vector --config /etc/vector/vector.yaml
 ```
 
 You should see lines like this emitted via stdout (formatted for readability
@@ -109,31 +116,33 @@ So far, we've gotten Vector to *parse* the Syslog data but we're not yet
 *modifying* that data. So let's update the `source` script of our `remap`
 transform to make some ad hoc transformations:
 
-```toml
-[transforms.modify]
-  type = "remap"
-  inputs = ["logs"]
-  source = '''
-  . = parse_syslog!(.message)
+```yaml
+transforms:
+  modify:
+    type: remap
+    inputs:
+      - logs
+    source: |
+      . = parse_syslog!(.message)
 
-  # Convert the timestamp to a Unix timestamp, aborting on error
-  .timestamp = to_unix_timestamp!(.timestamp)
+      # Convert the timestamp to a Unix timestamp, aborting on error
+      .timestamp = to_unix_timestamp!(.timestamp)
 
-  # Remove the "facility" and "procid" fields
-  del(.facility); del(.procid)
+      # Remove the "facility" and "procid" fields
+      del(.facility)
+      del(.procid)
 
-  # Replace the "msgid" field with a unique ID
-  .msgid = uuid_v4()
+      # Replace the "msgid" field with a unique ID
+      .msgid = uuid_v4()
 
-  # If the log message contains the phrase "Great Scott!", set the new field
-  # "critical" to true, otherwise set it to false. If the "contains" function
-  # errors, log the error (instead of aborting the script, as above).
-  if (is_critical, err = contains(.message, "Great Scott!"); err != null) {
-    log(err, level: "error")
-  }
+      # If the log message contains the phrase "Great Scott!", set the new field
+      # "critical" to true, otherwise set it to false. If the "contains" function
+      # errors, log the error (instead of aborting the script, as above).
+      if (is_critical, err = contains(.message, "Great Scott!"); err != null) {
+        log(err, level: "error")
+      }
 
-  .critical = is_critical
-  '''
+      .critical = is_critical
 ```
 
 A few things to notice about this script:
@@ -173,7 +182,7 @@ recommend checking out the following documentation:
 * [VRL expressions][docs.vrl.expressions], which describes things VRL's syntax
   and type system in great detail
 
-## Runtime transforms
+## Lua runtime transform
 
 If VRL doesn't cover your use case—and that should happen rarely—Vector also
 offers a [`lua`][docs.lua] **runtime transform** that you can use instead of
@@ -195,7 +204,7 @@ using it only when truly necessary, for several reasons:
 [docs.lua]: /docs/reference/configuration/transforms/lua/
 [docs.setup.quickstart]: /docs/setup/quickstart/
 [docs.sinks.console]: /docs/reference/configuration/sinks/console/
-[docs.sources.generator]: /docs/reference/configuration/sources/generator/
+[docs.sources.demo_logs]: /docs/reference/configuration/sources/demo_logs/
 [docs.transforms.remap]: /docs/reference/configuration/transforms/remap/
 [docs.transforms]: /docs/reference/configuration/transforms/
 [docs.vrl.examples]: /docs/reference/vrl/examples/

@@ -3,28 +3,31 @@ pub mod source;
 pub mod state;
 pub mod transform;
 
+use std::{
+    cmp,
+    collections::{HashMap, HashSet},
+    sync::LazyLock,
+};
+
+use async_graphql::{Enum, InputObject, Interface, Object, Subscription};
+use tokio_stream::{wrappers::BroadcastStream, Stream, StreamExt};
+use vector_lib::internal_event::DEFAULT_OUTPUT;
+
 use crate::{
     api::schema::{
         components::state::component_by_component_key,
         filter::{self, filter_items},
         relay, sort,
     },
-    config::ComponentKey,
-    config::Config,
+    config::{get_transform_output_ids, ComponentKey, Config},
     filter_check,
 };
-use async_graphql::{Enum, InputObject, Interface, Object, Subscription};
-use lazy_static::lazy_static;
-use std::{
-    cmp,
-    collections::{HashMap, HashSet},
-};
-use tokio_stream::{wrappers::BroadcastStream, Stream, StreamExt};
 
+#[allow(clippy::duplicated_attributes)] // False positive caused by `ty = "String"`
 #[derive(Debug, Clone, Interface)]
 #[graphql(
-    field(name = "component_id", type = "String"),
-    field(name = "component_type", type = "String")
+    field(name = "component_id", ty = "String"),
+    field(name = "component_type", ty = "String")
 )]
 pub enum Component {
     Source(source::Source),
@@ -104,6 +107,7 @@ impl sort::SortableByField<ComponentsSortFieldName> for Component {
 #[derive(Default)]
 pub struct ComponentsQuery;
 
+#[allow(clippy::too_many_arguments)]
 #[Object]
 impl ComponentsQuery {
     /// Configured components (sources/transforms/sinks)
@@ -208,7 +212,7 @@ impl ComponentsQuery {
 
     /// Gets a configured component by component_key
     async fn component_by_component_key(&self, component_id: String) -> Option<Component> {
-        let key = ComponentKey::global(&component_id);
+        let key = ComponentKey::from(component_id);
         component_by_component_key(&key)
     }
 }
@@ -219,12 +223,11 @@ enum ComponentChanged {
     Removed(Component),
 }
 
-lazy_static! {
-    static ref COMPONENT_CHANGED: tokio::sync::broadcast::Sender<ComponentChanged> = {
+static COMPONENT_CHANGED: LazyLock<tokio::sync::broadcast::Sender<ComponentChanged>> =
+    LazyLock::new(|| {
         let (tx, _) = tokio::sync::broadcast::channel(10);
         tx
-    };
-}
+    });
 
 #[derive(Debug, Default)]
 pub struct ComponentsSubscription;
@@ -253,36 +256,64 @@ pub fn update_config(config: &Config) {
     let mut new_components = HashMap::new();
 
     // Sources
-    for (component_key, source) in config.sources.iter() {
+    for (component_key, source) in config.sources() {
         new_components.insert(
             component_key.clone(),
             Component::Source(source::Source(source::Data {
                 component_key: component_key.clone(),
-                component_type: source.inner.source_type().to_string(),
-                output_type: source.inner.output_type(),
+                component_type: source.inner.get_component_name().to_string(),
+                // TODO(#10745): This is obviously wrong, but there are a lot of assumptions in the
+                // API modules about `output_type` as it's a sortable field, etc. This is a stopgap
+                // until we decide how we want to change the rest of the usages.
+                output_type: source
+                    .inner
+                    .outputs(config.schema.log_namespace())
+                    .pop()
+                    .unwrap()
+                    .ty,
+                outputs: source
+                    .inner
+                    .outputs(config.schema.log_namespace())
+                    .into_iter()
+                    .map(|output| output.port.unwrap_or_else(|| DEFAULT_OUTPUT.to_string()))
+                    .collect(),
             })),
         );
     }
 
     // Transforms
-    for (component_key, transform) in config.transforms.iter() {
+    for (component_key, transform) in config.transforms() {
         new_components.insert(
             component_key.clone(),
             Component::Transform(transform::Transform(transform::Data {
                 component_key: component_key.clone(),
-                component_type: transform.inner.transform_type().to_string(),
+                component_type: transform.inner.get_component_name().to_string(),
                 inputs: transform.inputs.clone(),
+                outputs: get_transform_output_ids(
+                    transform.inner.as_ref(),
+                    "".into(),
+                    config.schema.log_namespace(),
+                )
+                .map(|output| output.port.unwrap_or_else(|| DEFAULT_OUTPUT.to_string()))
+                .collect(),
             })),
         );
     }
 
     // Sinks
-    for (component_key, sink) in config.sinks.iter() {
+    let table_sinks = config
+        .enrichment_tables()
+        .filter_map(|(k, e)| e.as_sink().map(|s| (k, s)))
+        .collect::<Vec<_>>();
+    for (component_key, sink) in config
+        .sinks()
+        .chain(table_sinks.iter().map(|(key, sink)| (*key, sink)))
+    {
         new_components.insert(
             component_key.clone(),
             Component::Sink(sink::Sink(sink::Data {
                 component_key: component_key.clone(),
-                component_type: sink.inner.sink_type().to_string(),
+                component_type: sink.inner.get_component_name().to_string(),
                 inputs: sink.inputs.clone(),
             })),
         );
@@ -291,15 +322,15 @@ pub fn update_config(config: &Config) {
     // Get the component_ids of existing components
     let existing_component_keys = state::get_component_keys();
     let new_component_keys = new_components
-        .iter()
-        .map(|(component_key, _)| component_key.clone())
+        .keys()
+        .cloned()
         .collect::<HashSet<ComponentKey>>();
 
     // Publish all components that have been removed
     existing_component_keys
         .difference(&new_component_keys)
         .for_each(|component_key| {
-            let _ = COMPONENT_CHANGED.send(ComponentChanged::Removed(
+            _ = COMPONENT_CHANGED.send(ComponentChanged::Removed(
                 state::component_by_component_key(component_key)
                     .expect("Couldn't get component by key"),
             ));
@@ -309,7 +340,7 @@ pub fn update_config(config: &Config) {
     new_component_keys
         .difference(&existing_component_keys)
         .for_each(|component_key| {
-            let _ = COMPONENT_CHANGED.send(ComponentChanged::Added(
+            _ = COMPONENT_CHANGED.send(ComponentChanged::Added(
                 new_components.get(component_key).unwrap().clone(),
             ));
         });
@@ -331,28 +362,32 @@ mod tests {
         vec![
             Component::Source(source::Source(source::Data {
                 component_key: ComponentKey::from("gen1"),
-                component_type: "generator".to_string(),
+                component_type: "demo_logs".to_string(),
                 output_type: DataType::Metric,
+                outputs: vec![],
             })),
             Component::Source(source::Source(source::Data {
                 component_key: ComponentKey::from("gen2"),
-                component_type: "generator".to_string(),
+                component_type: "demo_logs".to_string(),
                 output_type: DataType::Metric,
+                outputs: vec![],
             })),
             Component::Source(source::Source(source::Data {
                 component_key: ComponentKey::from("gen3"),
-                component_type: "generator".to_string(),
+                component_type: "demo_logs".to_string(),
                 output_type: DataType::Metric,
+                outputs: vec![],
             })),
             Component::Transform(transform::Transform(transform::Data {
                 component_key: ComponentKey::from("parse_json"),
                 component_type: "json".to_string(),
-                inputs: vec![OutputId::from("gen1"), OutputId::from("gen2")],
+                inputs: vec![OutputId::from("gen1"), OutputId::from("gen2")].into(),
+                outputs: vec![],
             })),
             Component::Sink(sink::Sink(sink::Data {
                 component_key: ComponentKey::from("devnull"),
                 component_type: "blackhole".to_string(),
-                inputs: vec![OutputId::from("gen3"), OutputId::from("parse_json")],
+                inputs: vec![OutputId::from("gen3"), OutputId::from("parse_json")].into(),
             })),
         ]
     }
@@ -476,37 +511,42 @@ mod tests {
             Component::Sink(sink::Sink(sink::Data {
                 component_key: ComponentKey::from("a"),
                 component_type: "blackhole".to_string(),
-                inputs: vec![OutputId::from("gen3"), OutputId::from("parse_json")],
+                inputs: vec![OutputId::from("gen3"), OutputId::from("parse_json")].into(),
             })),
             Component::Sink(sink::Sink(sink::Data {
                 component_key: ComponentKey::from("b"),
                 component_type: "blackhole".to_string(),
-                inputs: vec![OutputId::from("gen3"), OutputId::from("parse_json")],
+                inputs: vec![OutputId::from("gen3"), OutputId::from("parse_json")].into(),
             })),
             Component::Transform(transform::Transform(transform::Data {
                 component_key: ComponentKey::from("c"),
                 component_type: "json".to_string(),
-                inputs: vec![OutputId::from("gen1"), OutputId::from("gen2")],
+                inputs: vec![OutputId::from("gen1"), OutputId::from("gen2")].into(),
+                outputs: vec![],
             })),
             Component::Source(source::Source(source::Data {
                 component_key: ComponentKey::from("e"),
-                component_type: "generator".to_string(),
+                component_type: "demo_logs".to_string(),
                 output_type: DataType::Metric,
+                outputs: vec![],
             })),
             Component::Source(source::Source(source::Data {
                 component_key: ComponentKey::from("d"),
-                component_type: "generator".to_string(),
+                component_type: "demo_logs".to_string(),
                 output_type: DataType::Metric,
+                outputs: vec![],
             })),
             Component::Source(source::Source(source::Data {
                 component_key: ComponentKey::from("g"),
-                component_type: "generator".to_string(),
+                component_type: "demo_logs".to_string(),
                 output_type: DataType::Metric,
+                outputs: vec![],
             })),
             Component::Source(source::Source(source::Data {
                 component_key: ComponentKey::from("f"),
-                component_type: "generator".to_string(),
+                component_type: "demo_logs".to_string(),
                 output_type: DataType::Metric,
+                outputs: vec![],
             })),
         ];
 

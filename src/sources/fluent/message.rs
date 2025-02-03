@@ -1,9 +1,9 @@
-use chrono::serde::ts_seconds;
-use chrono::{DateTime, TimeZone, Utc};
-use serde::Deserialize;
-use std::collections::BTreeMap;
-use std::convert::TryInto;
-use vector_core::event::Value;
+use std::{collections::BTreeMap, convert::TryInto};
+
+use chrono::{serde::ts_seconds, DateTime, TimeZone, Utc};
+use ordered_float::NotNan;
+use serde::{Deserialize, Serialize};
+use vector_lib::event::{KeyString, ObjectMap, Value};
 
 /// Fluent msgpack messages can be encoded in one of three ways, each with and
 /// without options, all using arrays to encode the top-level fields.
@@ -13,8 +13,8 @@ use vector_core::event::Value;
 ///
 /// Not yet handled are the handshake messages.
 ///
-/// https://github.com/fluent/fluentd/wiki/Forward-Protocol-Specification-v1#event-modes
-#[derive(Debug, Deserialize)]
+/// <https://github.com/fluent/fluentd/wiki/Forward-Protocol-Specification-v1#event-modes>
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(untagged)]
 pub(super) enum FluentMessage {
     Message(FluentTag, FluentTimestamp, FluentRecord),
@@ -38,19 +38,19 @@ pub(super) enum FluentMessage {
 
 /// Server options sent by client.
 ///
-/// https://github.com/fluent/fluentd/wiki/Forward-Protocol-Specification-v1#option
-#[derive(Default, Debug, Deserialize)]
+/// <https://github.com/fluent/fluentd/wiki/Forward-Protocol-Specification-v1#option>
+#[derive(Default, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub(super) struct FluentMessageOptions {
-    size: Option<u64>,     // client provided hint for the number of entries
-    chunk: Option<String>, // unused right now, would be used for acks
+    pub(super) size: Option<u64>, // client provided hint for the number of entries
+    pub(super) chunk: Option<String>, // client provided chunk identifier for acks
     pub(super) compressed: Option<String>, // this one is required if present
 }
 
 /// Fluent entry consisting of timestamp and record.
 ///
-/// https://github.com/fluent/fluentd/wiki/Forward-Protocol-Specification-v1#forward-mode
-#[derive(Debug, Deserialize)]
+/// <https://github.com/fluent/fluentd/wiki/Forward-Protocol-Specification-v1#forward-mode>
+#[derive(Debug, Deserialize, Serialize)]
 pub(super) struct FluentEntry(pub(super) FluentTimestamp, pub(super) FluentRecord);
 
 /// Fluent record is just key/value pairs.
@@ -61,8 +61,8 @@ pub(super) type FluentTag = String;
 
 /// Custom decoder for Fluent's EventTime msgpack extension.
 ///
-/// https://github.com/fluent/fluentd/wiki/Forward-Protocol-Specification-v1#eventtime-ext-format
-#[derive(Clone, Debug, PartialEq)]
+/// <https://github.com/fluent/fluentd/wiki/Forward-Protocol-Specification-v1#eventtime-ext-format>
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub(super) struct FluentEventTime(DateTime<Utc>);
 
 impl<'de> serde::de::Deserialize<'de> for FluentEventTime {
@@ -96,7 +96,7 @@ impl<'de> serde::de::Deserialize<'de> for FluentEventTime {
 
                 if tag != 0 {
                     return Err(serde::de::Error::custom(format!(
-                        "expected extension type 0 for fluent timestamp, got got {}",
+                        "expected extension type 0 for fluent timestamp, got {}",
                         tag
                     )));
                 }
@@ -117,7 +117,11 @@ impl<'de> serde::de::Deserialize<'de> for FluentEventTime {
                 let nanoseconds =
                     u32::from_be_bytes(bytes[4..].try_into().expect("exactly 4 bytes"));
 
-                Ok(FluentEventTime(Utc.timestamp(seconds.into(), nanoseconds)))
+                Ok(FluentEventTime(
+                    Utc.timestamp_opt(seconds.into(), nanoseconds)
+                        .single()
+                        .expect("invalid timestamp"),
+                ))
             }
         }
 
@@ -128,8 +132,14 @@ impl<'de> serde::de::Deserialize<'de> for FluentEventTime {
 /// Value for fluent record key.
 ///
 /// Used mostly just to implement value conversion.
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Deserialize, PartialEq, Serialize)]
 pub(super) struct FluentValue(rmpv::Value);
+
+impl From<rmpv::Value> for FluentValue {
+    fn from(value: rmpv::Value) -> Self {
+        Self(value)
+    }
+}
 
 impl From<FluentValue> for Value {
     fn from(value: FluentValue) -> Self {
@@ -142,8 +152,16 @@ impl From<FluentValue> for Value {
                 // unwrap large numbers to string similar to how
                 // `From<serde_json::Value> for Value` handles it
                 .unwrap_or_else(|| Value::Bytes(i.to_string().into())),
-            rmpv::Value::F32(f) => Value::Float(f.into()),
-            rmpv::Value::F64(f) => Value::Float(f),
+            rmpv::Value::F32(f) => {
+                // serde_json converts NaN to Null, so we model that behavior here since this is non-fallible
+                NotNan::new(f as f64)
+                    .map(Value::Float)
+                    .unwrap_or(Value::Null)
+            }
+            rmpv::Value::F64(f) => {
+                // serde_json converts NaN to Null, so we model that behavior here since this is non-fallible
+                NotNan::new(f).map(Value::Float).unwrap_or(Value::Null)
+            }
             rmpv::Value::String(s) => Value::Bytes(s.into_bytes().into()),
             rmpv::Value::Binary(bytes) => Value::Bytes(bytes.into()),
             rmpv::Value::Array(values) => Value::Array(
@@ -154,31 +172,31 @@ impl From<FluentValue> for Value {
             ),
             rmpv::Value::Map(values) => {
                 // Per
-                // https://github.com/fluent/fluentd/wiki/Forward-Protocol-Specification-v1#message-modes
+                // <https://github.com/fluent/fluentd/wiki/Forward-Protocol-Specification-v1#message-modes>
                 // we should expect that keys are always stringy. Ultimately a
                 // lot hinges on what
-                // https://github.com/fluent/fluentd/wiki/Forward-Protocol-Specification-v1#grammar
+                // <https://github.com/fluent/fluentd/wiki/Forward-Protocol-Specification-v1#grammar>
                 // defines 'object' as.
                 //
                 // The current implementation will SILENTLY DROP non-stringy keys.
-                Value::Map(
+                Value::Object(
                     values
                         .into_iter()
                         .filter_map(|(key, value)| {
                             key.as_str()
-                                .map(|k| (k.to_owned(), Value::from(FluentValue(value))))
+                                .map(|k| (k.into(), Value::from(FluentValue(value))))
                         })
                         .collect(),
                 )
             }
             rmpv::Value::Ext(code, bytes) => {
-                let mut fields = BTreeMap::new();
+                let mut fields = ObjectMap::new();
                 fields.insert(
-                    String::from("msgpack_extension_code"),
+                    KeyString::from("msgpack_extension_code"),
                     Value::Integer(code.into()),
                 );
-                fields.insert(String::from("bytes"), Value::Bytes(bytes.into()));
-                Value::Map(fields)
+                fields.insert(KeyString::from("bytes"), Value::Bytes(bytes.into()));
+                Value::Object(fields)
             }
         }
     }
@@ -187,7 +205,7 @@ impl From<FluentValue> for Value {
 /// Fluent message timestamp.
 ///
 /// Message timestamps can be a unix timestamp or EventTime messagepack ext.
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(untagged)]
 pub(super) enum FluentTimestamp {
     #[serde(with = "ts_seconds")]
@@ -207,11 +225,13 @@ impl From<FluentTimestamp> for Value {
 
 #[cfg(test)]
 mod test {
-    use crate::sources::fluent::message::FluentValue;
+    use std::collections::BTreeMap;
+
     use approx::assert_relative_eq;
     use quickcheck::quickcheck;
-    use std::collections::BTreeMap;
-    use vector_core::event::Value;
+    use vrl::value::{ObjectMap, Value};
+
+    use crate::sources::fluent::message::FluentValue;
 
     quickcheck! {
       fn from_bool(input: bool) -> () {
@@ -229,7 +249,7 @@ mod test {
 
     quickcheck! {
         fn from_u64(input: u64) -> () {
-            if input > i64::max_value() as u64 {
+            if input > i64::MAX as u64 {
                 assert_eq!(Value::from(FluentValue(rmpv::Value::Integer(rmpv::Integer::from(input)))),
                            Value::Bytes(input.to_string().into()))
             } else {
@@ -242,15 +262,10 @@ mod test {
     quickcheck! {
       fn from_f32(input: f32) -> () {
           let val = Value::from(FluentValue(rmpv::Value::F32(input)));
-          match val {
-              Value::Float(f) => {
-                  if f.is_nan() {
-                      assert!(input.is_nan());
-                  } else {
-                      assert_relative_eq!(input as f64, f);
-                  }
-              }
-              _ => unreachable!(),
+          if input.is_nan() {
+              assert_eq!(val, Value::Null);
+          } else {
+              assert_relative_eq!(input as f64, val.as_float().unwrap().into_inner());
           }
         }
     }
@@ -258,15 +273,10 @@ mod test {
     quickcheck! {
       fn from_f64(input: f64) -> () {
           let val = Value::from(FluentValue(rmpv::Value::F64(input)));
-          match val {
-              Value::Float(f) => {
-                  if f.is_nan() {
-                      assert!(input.is_nan());
-                  } else {
-                      assert_relative_eq!(input, f);
-                  }
-              }
-              _ => unreachable!(),
+          if input.is_nan() {
+              assert_eq!(val, Value::Null);
+          } else {
+              assert_relative_eq!(input, val.as_float().unwrap().into_inner());
           }
         }
     }
@@ -300,11 +310,11 @@ mod test {
             let actual_inner: Vec<(rmpv::Value, rmpv::Value)> = input.clone().into_iter().map(|(k,v)| (key_fn(k), val_fn(v))).collect();
             let actual = rmpv::Value::Map(actual_inner);
 
-            let mut expected_inner = BTreeMap::new();
+            let mut expected_inner = ObjectMap::new();
             for (k,v) in input.into_iter() {
-                expected_inner.insert(k, Value::Integer(v));
+                expected_inner.insert(k.into(), Value::Integer(v));
             }
-            let expected = Value::Map(expected_inner);
+            let expected = Value::Object(expected_inner);
 
             assert_eq!(Value::from(FluentValue(actual)), expected);
       }
@@ -321,7 +331,7 @@ mod test {
             let actual_inner: Vec<(rmpv::Value, rmpv::Value)> = input.into_iter().map(|(k,v)| (key_fn(k), val_fn(v))).collect();
             let actual = rmpv::Value::Map(actual_inner);
 
-            let expected = Value::Map(BTreeMap::new());
+            let expected = Value::Object(BTreeMap::new());
 
             assert_eq!(Value::from(FluentValue(actual)), expected);
       }
@@ -336,10 +346,10 @@ mod test {
         fn from_ext(code: i8, bytes: Vec<u8>) -> () {
             let actual = rmpv::Value::Ext(code, bytes.clone());
 
-            let mut inner = BTreeMap::new();
-            inner.insert("msgpack_extension_code".to_string(), Value::Integer(code.into()));
-            inner.insert("bytes".to_string(), Value::Bytes(bytes.into()));
-            let expected = Value::Map(inner);
+            let mut inner = ObjectMap::new();
+            inner.insert("msgpack_extension_code".into(), Value::Integer(code.into()));
+            inner.insert("bytes".into(), Value::Bytes(bytes.into()));
+            let expected = Value::Object(inner);
 
             assert_eq!(Value::from(FluentValue(actual)), expected);
       }

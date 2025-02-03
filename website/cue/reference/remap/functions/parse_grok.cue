@@ -3,7 +3,7 @@ package metadata
 remap: functions: parse_grok: {
 	category:    "Parse"
 	description: """
-		Parses the `value` using the [`grok` format](\(urls.grok)). All patterns [listed here](\(urls.grok_patterns))
+		Parses the `value` using the [`grok`](\(urls.grok)) format. All patterns [listed here](\(urls.grok_patterns))
 		are supported.
 		"""
 	notices: [
@@ -26,16 +26,9 @@ remap: functions: parse_grok: {
 			required:    true
 			type: ["string"]
 		},
-		{
-			name:        "remove_empty"
-			description: "If set to `true`, any patterns that resolve to an empty value are removed from the result."
-			required:    false
-			default:     true
-			type: ["boolean"]
-		},
 	]
 	internal_failure_reasons: [
-		"`value` fails to parse using the provided `pattern`",
+		"`value` fails to parse using the provided `pattern`.",
 	]
 	return: types: ["object"]
 

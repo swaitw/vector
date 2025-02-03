@@ -8,7 +8,7 @@ package metadata
 #Glossary: [#Term, ...#Term]
 
 glossary: #Glossary & [
-		{
+	{
 		term:        "Batch"
 		description: """
 			A [batched payload](\(urls.vector_log)) within a [sink](#sink). It is a batch of events
@@ -53,6 +53,17 @@ glossary: #Glossary & [
 		description: """
 			The ability to retain data across exceptional events. In the context of Vector, this
 			typically refers to the ability to retain data across restarts.
+			"""
+	},
+	{
+		term:        "Enrichment tables"
+		description: """
+			File-based information that you can use to enrich Vector [events](#event) in
+			[`remap`](\(urls.vector_remap_transform)) transforms. [VRL](\(urls.vrl_reference))
+			provides two functions for using enrichment tables:
+
+			* [`find_enrichment_table_records`](\(urls.vrl_functions)/#find_enrichment_table_records)
+			* [`get_enrichment_table_record`](\(urls.vrl_functions)/#get_enrichment_table_record)
 			"""
 	},
 	{

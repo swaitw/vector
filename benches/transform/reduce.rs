@@ -1,15 +1,15 @@
-use crate::common::{consume, FixedLogStream};
 use core::fmt;
-use criterion::BenchmarkId;
+use std::{num::NonZeroUsize, time::Duration};
+
 use criterion::{
-    criterion_group, measurement::WallTime, BatchSize, BenchmarkGroup, Criterion, SamplingMode,
-    Throughput,
+    criterion_group, measurement::WallTime, BatchSize, BenchmarkGroup, BenchmarkId, Criterion,
+    SamplingMode, Throughput,
 };
 use indexmap::IndexMap;
-use std::num::NonZeroUsize;
-use std::time::Duration;
 use vector::transforms::reduce::{Reduce, ReduceConfig};
-use vector_core::transform::Transform;
+use vector_lib::transform::Transform;
+
+use crate::common::{consume, FixedLogStream};
 
 #[derive(Debug)]
 struct Param {
@@ -38,17 +38,18 @@ fn reduce(c: &mut Criterion) {
         // only benchmark the "proof of concept" configuration, demonstrating
         // that the benchmark does minimally work. Once we have soak tests with
         // reduces in them we should extend this array to include those
-        // configuratoins.
+        // configurations.
         Param {
             slug: "proof_of_concept",
             input: fixed_stream.clone(),
             reduce_config: ReduceConfig {
-                expire_after_ms: None,
-                flush_period_ms: None,
+                expire_after_ms: Duration::from_secs(30),
+                flush_period_ms: Duration::from_secs(1),
                 group_by: vec![String::from("message")],
                 merge_strategies: IndexMap::default(),
                 ends_when: None,
                 starts_when: None,
+                max_events: None,
             },
         },
     ] {
@@ -57,14 +58,14 @@ fn reduce(c: &mut Criterion) {
             b.to_async(tokio::runtime::Runtime::new().unwrap())
                 .iter_batched(
                     || {
-                        let reduce = Transform::task(
+                        let reduce = Transform::event_task(
                             Reduce::new(&param.reduce_config, &Default::default()).unwrap(),
                         )
                         .into_task();
                         (Box::new(reduce), Box::pin(param.input.clone()))
                     },
                     |(reduce, input)| async {
-                        let output = reduce.transform(input);
+                        let output = reduce.transform_events(input);
                         consume(output)
                     },
                     BatchSize::SmallInput,

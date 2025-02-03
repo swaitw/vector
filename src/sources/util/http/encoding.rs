@@ -1,12 +1,14 @@
-use super::error::ErrorMessage;
-use crate::internal_events::HttpDecompressError;
+use std::io::Read;
+
 use bytes::{Buf, Bytes};
 use flate2::read::{MultiGzDecoder, ZlibDecoder};
 use snap::raw::Decoder as SnappyDecoder;
-use std::io::Read;
 use warp::http::StatusCode;
 
-pub fn decode(header: &Option<String>, mut body: Bytes) -> Result<Bytes, ErrorMessage> {
+use super::error::ErrorMessage;
+use crate::internal_events::HttpDecompressError;
+
+pub fn decode(header: Option<&str>, mut body: Bytes) -> Result<Bytes, ErrorMessage> {
     if let Some(encodings) = header {
         for encoding in encodings.rsplit(',').map(str::trim) {
             body = match encoding {
@@ -29,6 +31,9 @@ pub fn decode(header: &Option<String>, mut body: Bytes) -> Result<Bytes, ErrorMe
                     .decompress_vec(&body)
                     .map_err(|error| handle_decode_error(encoding, error))?
                     .into(),
+                "zstd" => zstd::decode_all(body.reader())
+                    .map_err(|error| handle_decode_error(encoding, error))?
+                    .into(),
                 encoding => {
                     return Err(ErrorMessage::new(
                         StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -43,7 +48,7 @@ pub fn decode(header: &Option<String>, mut body: Bytes) -> Result<Bytes, ErrorMe
 }
 
 fn handle_decode_error(encoding: &str, error: impl std::error::Error) -> ErrorMessage {
-    emit!(&HttpDecompressError {
+    emit!(HttpDecompressError {
         encoding,
         error: &error
     });
